@@ -217,6 +217,102 @@ test "Scenario: Given command help selector when parsing then command-specific h
     try expectHelp(result, .list);
 }
 
+test "Scenario: Given warm without args when parsing then it targets the active account" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "warm" };
+    var result = try cli.parseArgs(gpa, &args);
+    defer cli.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .warm => |opts| {
+                try std.testing.expect(opts.query == null);
+                try std.testing.expect(opts.account_key == null);
+                try std.testing.expect(!opts.all);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given warm query when parsing then it preserves the selector" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "warm", "work" };
+    var result = try cli.parseArgs(gpa, &args);
+    defer cli.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .warm => |opts| {
+                try std.testing.expect(opts.query != null);
+                try std.testing.expectEqualStrings("work", opts.query.?);
+                try std.testing.expect(opts.account_key == null);
+                try std.testing.expect(!opts.all);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given warm all when parsing then it preserves the bulk selector" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "warm", "--all" };
+    var result = try cli.parseArgs(gpa, &args);
+    defer cli.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .warm => |opts| {
+                try std.testing.expect(opts.query == null);
+                try std.testing.expect(opts.account_key == null);
+                try std.testing.expect(opts.all);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given warm all with another selector when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "warm", "--all", "work" };
+    var result = try cli.parseArgs(gpa, &args);
+    defer cli.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .warm, "`warm` cannot combine `--all`");
+}
+
+test "Scenario: Given warm with exact account key when parsing then it preserves the exact selector" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "warm", "--account-key", "user-abc::workspace-id" };
+    var result = try cli.parseArgs(gpa, &args);
+    defer cli.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .warm => |opts| {
+                try std.testing.expect(opts.query == null);
+                try std.testing.expect(opts.account_key != null);
+                try std.testing.expectEqualStrings("user-abc::workspace-id", opts.account_key.?);
+                try std.testing.expect(!opts.all);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given warm with account key mixed with another selector when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "warm", "--account-key", "user-abc::workspace-id", "work" };
+    var result = try cli.parseArgs(gpa, &args);
+    defer cli.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .warm, "cannot combine `--account-key`");
+}
+
 test "Scenario: Given help when rendering then login and command help notes are shown" {
     const gpa = std.testing.allocator;
     var aw: std.Io.Writer.Allocating = .init(gpa);
@@ -240,12 +336,14 @@ test "Scenario: Given help when rendering then login and command help notes are 
     try std.testing.expect(std.mem.indexOf(u8, help, "`config api enable` may trigger OpenAI account restrictions or suspension in some environments.") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "login") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "clean") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "switch [<query>|--best|--account-key <record_key>]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "remove [<query>|--all]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "Delete backup and stale files under accounts/") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "status") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "config") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "auto enable") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "auto disable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "auto mode <reactive|proactive|pinned|failover>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "auto --5h <percent> [--weekly <percent>]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "api enable") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "api disable") != null);
@@ -419,6 +517,27 @@ test "Scenario: Given config auto enable when parsing then auto action is preser
     }
 }
 
+test "Scenario: Given config auto mode when parsing then auto mode is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "config", "auto", "mode", "failover" };
+    var result = try cli.parseArgs(gpa, &args);
+    defer cli.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .config => |opts| switch (opts) {
+                .auto_switch => |auto_opts| switch (auto_opts) {
+                    .mode => |mode| try std.testing.expectEqual(registry.AutoSwitchMode.failover, mode),
+                    else => return error.TestExpectedEqual,
+                },
+                else => return error.TestExpectedEqual,
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
 test "Scenario: Given config api enable when parsing then api action is preserved" {
     const gpa = std.testing.allocator;
     const args = [_][:0]const u8{ "codex-auth", "config", "api", "enable" };
@@ -462,6 +581,24 @@ test "Scenario: Given config auto action mixed with threshold flags when parsing
     defer cli.freeParseResult(gpa, &result);
 
     try expectUsageError(result, .config, "cannot mix actions");
+}
+
+test "Scenario: Given config auto mode without value when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "config", "auto", "mode" };
+    var result = try cli.parseArgs(gpa, &args);
+    defer cli.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .config, "requires `reactive`, `proactive`, `pinned`, or `failover`");
+}
+
+test "Scenario: Given config auto with unknown mode when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "config", "auto", "mode", "always-best" };
+    var result = try cli.parseArgs(gpa, &args);
+    defer cli.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .config, "unknown mode `always-best`");
 }
 
 test "Scenario: Given config auto threshold percent out of range when parsing then usage error is returned" {
@@ -658,6 +795,27 @@ test "Scenario: Given switch with positional query when parsing then non-interac
             .switch_account => |opts| {
                 try std.testing.expect(opts.query != null);
                 try std.testing.expect(std.mem.eql(u8, opts.query.?, "user@example.com"));
+                try std.testing.expect(opts.account_key == null);
+                try std.testing.expect(!opts.best);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given switch with best flag when parsing then best mode is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "switch", "--best" };
+    var result = try cli.parseArgs(gpa, &args);
+    defer cli.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .switch_account => |opts| {
+                try std.testing.expect(opts.query == null);
+                try std.testing.expect(opts.account_key == null);
+                try std.testing.expect(opts.best);
             },
             else => return error.TestExpectedEqual,
         },
@@ -674,6 +832,26 @@ test "Scenario: Given switch with duplicate target when parsing then usage error
     try expectUsageError(result, .switch_account, "unexpected extra query");
 }
 
+test "Scenario: Given switch with exact account key when parsing then it preserves the exact selector" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "switch", "--account-key", "user-abc::workspace-id" };
+    var result = try cli.parseArgs(gpa, &args);
+    defer cli.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .switch_account => |opts| {
+                try std.testing.expect(opts.query == null);
+                try std.testing.expect(opts.account_key != null);
+                try std.testing.expectEqualStrings("user-abc::workspace-id", opts.account_key.?);
+                try std.testing.expect(!opts.best);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
 test "Scenario: Given switch with unexpected flag when parsing then usage error is returned" {
     const gpa = std.testing.allocator;
     const args = [_][:0]const u8{ "codex-auth", "switch", "--email", "a@example.com" };
@@ -681,6 +859,24 @@ test "Scenario: Given switch with unexpected flag when parsing then usage error 
     defer cli.freeParseResult(gpa, &result);
 
     try expectUsageError(result, .switch_account, "unknown flag");
+}
+
+test "Scenario: Given switch with best flag mixed with query when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "switch", "--best", "a@example.com" };
+    var result = try cli.parseArgs(gpa, &args);
+    defer cli.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .switch_account, "cannot combine `--best`");
+}
+
+test "Scenario: Given switch with account key mixed with another selector when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "switch", "--account-key", "user-abc::workspace-id", "a@example.com" };
+    var result = try cli.parseArgs(gpa, &args);
+    defer cli.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .switch_account, "cannot combine `--account-key`");
 }
 
 test "Scenario: Given remove with positional query when parsing then query mode is preserved" {

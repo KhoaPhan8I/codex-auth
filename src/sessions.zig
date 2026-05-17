@@ -13,6 +13,15 @@ pub const LatestUsage = struct {
     }
 };
 
+fn cloneLatestUsage(allocator: std.mem.Allocator, latest: LatestUsage) !LatestUsage {
+    return .{
+        .path = try allocator.dupe(u8, latest.path),
+        .mtime = latest.mtime,
+        .event_timestamp_ms = latest.event_timestamp_ms,
+        .snapshot = try registry.cloneRateLimitSnapshot(allocator, latest.snapshot),
+    };
+}
+
 pub const LatestRolloutEvent = struct {
     path: []u8,
     mtime: i64,
@@ -77,10 +86,12 @@ const UsageCreditsJson = struct {
 const max_recent_rollout_files: usize = 1;
 const max_rollout_line_bytes: usize = 10 * 1024 * 1024;
 const rollout_full_rescan_interval_ns = 15 * std.time.ns_per_s;
+const runtime_rollout_cache_file_name = "latest-rollout.json";
 
 pub const RolloutScanCache = struct {
     last_full_scan_at_ns: i128 = 0,
     latest: ?LatestRolloutEvent = null,
+    latest_usable: ?LatestUsage = null,
 
     pub fn deinit(self: *RolloutScanCache, allocator: std.mem.Allocator) void {
         self.clear(allocator);
@@ -90,21 +101,42 @@ pub const RolloutScanCache = struct {
         if (self.latest) |*latest| {
             latest.deinit(allocator);
         }
+        if (self.latest_usable) |*latest_usable| {
+            latest_usable.deinit(allocator);
+        }
         self.latest = null;
+        self.latest_usable = null;
         self.last_full_scan_at_ns = 0;
     }
 
-    fn replace(self: *RolloutScanCache, allocator: std.mem.Allocator, latest: ?LatestRolloutEvent, scanned_at_ns: i128) void {
+    fn replace(
+        self: *RolloutScanCache,
+        allocator: std.mem.Allocator,
+        latest: ?LatestRolloutEvent,
+        latest_usable: ?LatestUsage,
+        scanned_at_ns: i128,
+    ) void {
         if (self.latest) |*cached| {
             cached.deinit(allocator);
         }
+        if (self.latest_usable) |*cached_usable| {
+            cached_usable.deinit(allocator);
+        }
         self.latest = latest;
+        self.latest_usable = latest_usable;
         self.last_full_scan_at_ns = scanned_at_ns;
     }
 
     fn cloneLatest(self: *const RolloutScanCache, allocator: std.mem.Allocator) !?LatestRolloutEvent {
         if (self.latest) |latest| {
             return try cloneLatestRolloutEvent(allocator, latest);
+        }
+        return null;
+    }
+
+    fn cloneLatestUsable(self: *const RolloutScanCache, allocator: std.mem.Allocator) !?LatestUsage {
+        if (self.latest_usable) |latest| {
+            return try cloneLatestUsage(allocator, latest);
         }
         return null;
     }
@@ -120,23 +152,102 @@ pub fn scanLatestUsage(allocator: std.mem.Allocator, codex_home: []const u8) !?r
 pub fn scanLatestUsageWithSource(allocator: std.mem.Allocator, codex_home: []const u8) !?LatestUsage {
     var latest_rollout = (try scanLatestRolloutEventWithSource(allocator, codex_home)) orelse return null;
     errdefer latest_rollout.deinit(allocator);
-    if (!latest_rollout.hasUsableWindows()) {
-        const latest_usable = try scanLatestUsableUsageInFile(allocator, latest_rollout.path, latest_rollout.mtime);
-        if (latest_usable == null) {
-            latest_rollout.deinit(allocator);
+    var resolved = try resolveLatestRolloutState(allocator, latest_rollout);
+    defer resolved.deinit(allocator);
+    saveRuntimeRolloutCacheBestEffort(allocator, codex_home, resolved.latest, resolved.latest_usable, std.time.nanoTimestamp());
+    if (resolved.latest_usable) |latest_usable| {
+        return try cloneLatestUsage(allocator, latest_usable);
+    }
+    return null;
+}
+
+pub fn scanLatestUsageWithRuntimeCache(allocator: std.mem.Allocator, codex_home: []const u8) !?LatestUsage {
+    const now_ns = std.time.nanoTimestamp();
+    if (try loadRuntimeRolloutCache(allocator, codex_home, now_ns)) |loaded| {
+        var cached = loaded;
+        defer cached.deinit(allocator);
+        if (cached.latest_usable == null and !cached.latest.hasUsableWindows()) {
+            // Older cache files may not include the newest usable snapshot.
+        } else if (cached.latest_usable) |latest_usable| {
+            return try cloneLatestUsage(allocator, latest_usable);
+        } else if (cached.latest.hasUsableWindows()) {
+            return try cloneLatestUsage(allocator, .{
+                .path = cached.latest.path,
+                .mtime = cached.latest.mtime,
+                .event_timestamp_ms = cached.latest.event_timestamp_ms,
+                .snapshot = cached.latest.snapshot.?,
+            });
+        } else {
             return null;
         }
-        latest_rollout.deinit(allocator);
+    }
+
+    var latest_rollout = (try scanLatestRolloutEventWithSource(allocator, codex_home)) orelse return null;
+    errdefer latest_rollout.deinit(allocator);
+    var resolved = try resolveLatestRolloutState(allocator, latest_rollout);
+    defer resolved.deinit(allocator);
+    saveRuntimeRolloutCacheBestEffort(allocator, codex_home, resolved.latest, resolved.latest_usable, now_ns);
+    if (resolved.latest_usable) |latest_usable| {
+        return try cloneLatestUsage(allocator, latest_usable);
+    }
+    return null;
+}
+
+fn latestUsageFromRolloutEvent(allocator: std.mem.Allocator, latest_rollout: LatestRolloutEvent) !?LatestUsage {
+    var owned = latest_rollout;
+    errdefer owned.deinit(allocator);
+    if (!latest_rollout.hasUsableWindows()) {
+        const latest_usable = try scanLatestUsableUsageInFile(allocator, owned.path, owned.mtime);
+        if (latest_usable == null) {
+            owned.deinit(allocator);
+            return null;
+        }
+        owned.deinit(allocator);
         return latest_usable;
     }
 
-    const snapshot = latest_rollout.snapshot.?;
-    latest_rollout.snapshot = null;
+    const snapshot = owned.snapshot.?;
+    owned.snapshot = null;
     return .{
-        .path = latest_rollout.path,
-        .mtime = latest_rollout.mtime,
-        .event_timestamp_ms = latest_rollout.event_timestamp_ms,
+        .path = owned.path,
+        .mtime = owned.mtime,
+        .event_timestamp_ms = owned.event_timestamp_ms,
         .snapshot = snapshot,
+    };
+}
+
+const ResolvedLatestRolloutState = struct {
+    latest: LatestRolloutEvent,
+    latest_usable: ?LatestUsage = null,
+
+    fn deinit(self: *ResolvedLatestRolloutState, allocator: std.mem.Allocator) void {
+        self.latest.deinit(allocator);
+        if (self.latest_usable) |*latest_usable| {
+            latest_usable.deinit(allocator);
+        }
+    }
+};
+
+fn resolveLatestRolloutState(
+    allocator: std.mem.Allocator,
+    latest_rollout: LatestRolloutEvent,
+) !ResolvedLatestRolloutState {
+    var owned = latest_rollout;
+    errdefer owned.deinit(allocator);
+
+    const latest_usable = if (owned.hasUsableWindows())
+        try cloneLatestUsage(allocator, .{
+            .path = owned.path,
+            .mtime = owned.mtime,
+            .event_timestamp_ms = owned.event_timestamp_ms,
+            .snapshot = owned.snapshot.?,
+        })
+    else
+        try scanLatestUsableUsageInFile(allocator, owned.path, owned.mtime);
+
+    return .{
+        .latest = owned,
+        .latest_usable = latest_usable,
     };
 }
 
@@ -240,6 +351,12 @@ pub fn scanLatestRolloutEventWithCache(
 ) !?LatestRolloutEvent {
     const now_ns = std.time.nanoTimestamp();
 
+    if (cache.latest == null) {
+        if (try loadRuntimeRolloutCache(allocator, codex_home, now_ns)) |cached| {
+            cache.replace(allocator, cached.latest, cached.latest_usable, now_ns);
+        }
+    }
+
     if (cache.latest) |cached| {
         const stat = std.fs.cwd().statFile(cached.path) catch |err| switch (err) {
             error.FileNotFound => return try refreshRolloutScanCache(allocator, codex_home, cache, now_ns),
@@ -249,10 +366,19 @@ pub fn scanLatestRolloutEventWithCache(
         if (current_mtime != cached.mtime) {
             const reparsed = try scanFileForUsage(allocator, cached.path);
             if (reparsed) |parsed| {
-                const updated = try latestRolloutEventFromParsedUsage(allocator, cached.path, current_mtime, parsed);
-                cache.replace(allocator, updated, cache.last_full_scan_at_ns);
+                var updated = try latestRolloutEventFromParsedUsage(allocator, cached.path, current_mtime, parsed);
+                errdefer updated.deinit(allocator);
+                const resolved = try resolveLatestRolloutState(allocator, updated);
+                cache.replace(allocator, resolved.latest, resolved.latest_usable, cache.last_full_scan_at_ns);
+                if (cache.latest) |latest| {
+                    saveRuntimeRolloutCacheBestEffort(allocator, codex_home, latest, cache.latest_usable, now_ns);
+                }
                 return try cache.cloneLatest(allocator);
             }
+            return try refreshRolloutScanCache(allocator, codex_home, cache, now_ns);
+        }
+
+        if (!cached.hasUsableWindows() and cache.latest_usable == null) {
             return try refreshRolloutScanCache(allocator, codex_home, cache, now_ns);
         }
 
@@ -338,8 +464,229 @@ fn refreshRolloutScanCache(
     scanned_at_ns: i128,
 ) !?LatestRolloutEvent {
     const latest = try scanLatestRolloutEventWithSource(allocator, codex_home);
-    cache.replace(allocator, latest, scanned_at_ns);
+    if (latest) |latest_rollout| {
+        const resolved = try resolveLatestRolloutState(allocator, latest_rollout);
+        cache.replace(allocator, resolved.latest, resolved.latest_usable, scanned_at_ns);
+    } else {
+        cache.replace(allocator, null, null, scanned_at_ns);
+    }
+    if (cache.latest) |resolved| {
+        saveRuntimeRolloutCacheBestEffort(allocator, codex_home, resolved, cache.latest_usable, scanned_at_ns);
+    } else {
+        clearRuntimeRolloutCacheBestEffort(allocator, codex_home);
+    }
     return try cache.cloneLatest(allocator);
+}
+
+const RuntimeRolloutCacheFile = struct {
+    scanned_at_ns: i64,
+    path: []const u8,
+    mtime: i64,
+    event_timestamp_ms: i64,
+    snapshot: ?RuntimeSnapshotFile = null,
+    latest_usable_event_timestamp_ms: ?i64 = null,
+    latest_usable_snapshot: ?RuntimeSnapshotFile = null,
+};
+
+const RuntimeSnapshotFile = struct {
+    primary: ?RuntimeWindowFile = null,
+    secondary: ?RuntimeWindowFile = null,
+    credits: ?RuntimeCreditsFile = null,
+    plan_type: ?[]const u8 = null,
+};
+
+const RuntimeWindowFile = struct {
+    used_percent: f64,
+    window_minutes: ?i64 = null,
+    resets_at: ?i64 = null,
+};
+
+const RuntimeCreditsFile = struct {
+    has_credits: bool = false,
+    unlimited: bool = false,
+};
+
+fn runtimeDirPath(allocator: std.mem.Allocator, codex_home: []const u8) ![]u8 {
+    return try std.fs.path.join(allocator, &[_][]const u8{ codex_home, "runtime" });
+}
+
+fn runtimeRolloutCachePath(allocator: std.mem.Allocator, codex_home: []const u8) ![]u8 {
+    return try std.fs.path.join(allocator, &[_][]const u8{ codex_home, "runtime", runtime_rollout_cache_file_name });
+}
+
+fn saveRuntimeRolloutCacheBestEffort(
+    allocator: std.mem.Allocator,
+    codex_home: []const u8,
+    latest: LatestRolloutEvent,
+    latest_usable: ?LatestUsage,
+    scanned_at_ns: i128,
+) void {
+    saveRuntimeRolloutCache(allocator, codex_home, latest, latest_usable, scanned_at_ns) catch {};
+}
+
+fn clearRuntimeRolloutCacheBestEffort(allocator: std.mem.Allocator, codex_home: []const u8) void {
+    const cache_path = runtimeRolloutCachePath(allocator, codex_home) catch return;
+    defer allocator.free(cache_path);
+    std.fs.cwd().deleteFile(cache_path) catch {};
+}
+
+fn saveRuntimeRolloutCache(
+    allocator: std.mem.Allocator,
+    codex_home: []const u8,
+    latest: LatestRolloutEvent,
+    latest_usable: ?LatestUsage,
+    scanned_at_ns: i128,
+) !void {
+    const runtime_dir = try runtimeDirPath(allocator, codex_home);
+    defer allocator.free(runtime_dir);
+    try std.fs.cwd().makePath(runtime_dir);
+
+    const cache_path = try runtimeRolloutCachePath(allocator, codex_home);
+    defer allocator.free(cache_path);
+
+    const payload: RuntimeRolloutCacheFile = .{
+        .scanned_at_ns = std.math.cast(i64, scanned_at_ns) orelse std.math.maxInt(i64),
+        .path = latest.path,
+        .mtime = latest.mtime,
+        .event_timestamp_ms = latest.event_timestamp_ms,
+        .snapshot = if (latest.snapshot) |snapshot| snapshotToRuntimeFile(snapshot) else null,
+        .latest_usable_event_timestamp_ms = if (latest_usable) |usage| usage.event_timestamp_ms else null,
+        .latest_usable_snapshot = if (latest_usable) |usage| snapshotToRuntimeFile(usage.snapshot) else null,
+    };
+
+    var json_buffer: std.Io.Writer.Allocating = .init(allocator);
+    defer json_buffer.deinit();
+    try std.json.Stringify.value(payload, .{}, &json_buffer.writer);
+
+    var write_buffer: [4096]u8 = undefined;
+    var atomic_file = try std.fs.cwd().atomicFile(cache_path, .{ .write_buffer = &write_buffer });
+    defer atomic_file.deinit();
+    try atomic_file.file_writer.interface.writeAll(json_buffer.written());
+    try atomic_file.finish();
+}
+
+fn loadRuntimeRolloutCache(
+    allocator: std.mem.Allocator,
+    codex_home: []const u8,
+    now_ns: i128,
+) !?ResolvedLatestRolloutState {
+    const cache_path = try runtimeRolloutCachePath(allocator, codex_home);
+    defer allocator.free(cache_path);
+
+    const file = std.fs.cwd().openFile(cache_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close();
+
+    const data = file.readToEndAlloc(allocator, 128 * 1024) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer allocator.free(data);
+
+    var parsed = std.json.parseFromSlice(RuntimeRolloutCacheFile, allocator, data, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer parsed.deinit();
+
+    const cached = parsed.value;
+    if (cached.scanned_at_ns == 0) return null;
+    const scanned_at_ns: i128 = cached.scanned_at_ns;
+    if ((now_ns - scanned_at_ns) >= rollout_full_rescan_interval_ns) return null;
+
+    const stat = std.fs.cwd().statFile(cached.path) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    if (@as(i64, @intCast(stat.mtime)) != cached.mtime) return null;
+
+    return .{
+        .latest = .{
+            .path = try allocator.dupe(u8, cached.path),
+            .mtime = cached.mtime,
+            .event_timestamp_ms = cached.event_timestamp_ms,
+            .snapshot = if (cached.snapshot) |snapshot| try runtimeFileToSnapshot(allocator, snapshot) else null,
+        },
+        .latest_usable = if (cached.latest_usable_snapshot) |snapshot| .{
+            .path = try allocator.dupe(u8, cached.path),
+            .mtime = cached.mtime,
+            .event_timestamp_ms = cached.latest_usable_event_timestamp_ms orelse return null,
+            .snapshot = try runtimeFileToSnapshot(allocator, snapshot),
+        } else if (cached.snapshot) |snapshot| blk: {
+            const latest_snapshot = try runtimeFileToSnapshot(allocator, snapshot);
+            if (latest_snapshot.primary == null and latest_snapshot.secondary == null) {
+                registry.freeRateLimitSnapshot(allocator, &latest_snapshot);
+                break :blk null;
+            }
+            break :blk .{
+                .path = try allocator.dupe(u8, cached.path),
+                .mtime = cached.mtime,
+                .event_timestamp_ms = cached.event_timestamp_ms,
+                .snapshot = latest_snapshot,
+            };
+        } else null,
+    };
+}
+
+pub fn cloneLatestUsableFromCache(
+    allocator: std.mem.Allocator,
+    cache: *const RolloutScanCache,
+) !?LatestUsage {
+    return try cache.cloneLatestUsable(allocator);
+}
+
+fn snapshotToRuntimeFile(snapshot: registry.RateLimitSnapshot) RuntimeSnapshotFile {
+    return .{
+        .primary = if (snapshot.primary) |window| windowToRuntimeFile(window) else null,
+        .secondary = if (snapshot.secondary) |window| windowToRuntimeFile(window) else null,
+        .credits = if (snapshot.credits) |credits| creditsToRuntimeFile(credits) else null,
+        .plan_type = if (snapshot.plan_type) |plan| @tagName(plan) else null,
+    };
+}
+
+fn windowToRuntimeFile(window: registry.RateLimitWindow) RuntimeWindowFile {
+    return .{
+        .used_percent = window.used_percent,
+        .window_minutes = window.window_minutes,
+        .resets_at = window.resets_at,
+    };
+}
+
+fn creditsToRuntimeFile(credits: registry.CreditsSnapshot) RuntimeCreditsFile {
+    return .{
+        .has_credits = credits.has_credits,
+        .unlimited = credits.unlimited,
+    };
+}
+
+fn runtimeFileToSnapshot(allocator: std.mem.Allocator, snapshot: RuntimeSnapshotFile) !registry.RateLimitSnapshot {
+    return .{
+        .primary = if (snapshot.primary) |window| runtimeFileToWindow(window) else null,
+        .secondary = if (snapshot.secondary) |window| runtimeFileToWindow(window) else null,
+        .credits = if (snapshot.credits) |credits| try runtimeFileToCredits(allocator, credits) else null,
+        .plan_type = if (snapshot.plan_type) |plan| parsePlanType(plan) else null,
+    };
+}
+
+fn runtimeFileToWindow(window: RuntimeWindowFile) registry.RateLimitWindow {
+    return .{
+        .used_percent = window.used_percent,
+        .window_minutes = window.window_minutes,
+        .resets_at = window.resets_at,
+    };
+}
+
+fn runtimeFileToCredits(allocator: std.mem.Allocator, credits: RuntimeCreditsFile) !registry.CreditsSnapshot {
+    _ = allocator;
+    return .{
+        .has_credits = credits.has_credits,
+        .unlimited = credits.unlimited,
+        .balance = null,
+    };
 }
 
 fn latestRolloutEventFromParsedUsage(

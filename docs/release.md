@@ -28,8 +28,18 @@ This document describes the repository's CI, preview package publishing, and tag
    - Update every platform package version under `package.json.optionalDependencies` to the same version.
 4. Validate the version change before committing.
    - Keep the version values aligned across `src/version.zig`, `package.json`, and the release tag you intend to create.
+   - Run `npm run check:versions`.
    - Because `src/version.zig` changes, run `zig build run -- list` before release.
-   - Run side-effecting validation from an isolated directory under `/tmp/<task-name>` with `HOME=/tmp/<task-name>`.
+   - Host packaging smoke is Linux x64 only because it installs the `@loongphy/codex-auth-linux-x64` package. If your local host is not Linux x64, run this validation in Linux or rely on CI.
+   - Run side-effecting packaging validation from an isolated directory under `/tmp/<task-name>` with `HOME=/tmp/<task-name>`.
+   - Build the host release binary with `zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe`.
+   - Create the host artifact tree:
+     - `mkdir -p /tmp/<task-name>/artifacts/linux-x64/binary`
+     - `cp zig-out/bin/codex-auth /tmp/<task-name>/artifacts/linux-x64/binary/codex-auth`
+   - Run `npm run check:release-host -- --artifacts-dir /tmp/<task-name>/artifacts --output-dir /tmp/<task-name>/dist/npm --packed-dir /tmp/<task-name>/dist/packed --smoke-dir /tmp/<task-name>/dist/smoke`.
+   - Run `npm run check:release-hygiene` before publishing any repo snapshot or release artifact.
+   - For desktop Linux packages, run `npm run desktop:linux:package` on Linux.
+   - For the Windows desktop installer, run `npm run desktop:windows:package` on Windows.
 5. Commit and push `main`.
    - Commit with a release message such as `chore: release v0.2.3-alpha.1`.
    - Push the commit to `origin/main`.
@@ -58,11 +68,25 @@ This document describes the repository's CI, preview package publishing, and tag
 - GitHub Release assets and npm packages currently target Linux x64, macOS x64, macOS ARM64, Windows x64, and Windows ARM64.
 - Windows builds include both `codex-auth.exe` and `codex-auth-auto.exe`; the helper is used only by the managed auto-switch task.
 
+## Desktop Package Layout
+
+- Desktop app source lives under `apps/codex-auth-desktop`.
+- Linux desktop release artifacts are `.rpm` and `.AppImage`.
+- Windows desktop release artifact is an unsigned Windows 10 x64 NSIS `.exe` installer.
+- Desktop packages bundle the matching `codex-auth` CLI binary under the app resource `bin/` directory.
+- Desktop packages must not include developer data from `~/.codex`, `~/.local/share/io.loongphy.codexauthstudio`, or `~/.local/opt/codex-auth-studio`.
+
 ## CI Workflow
 
 - Branch and pull request validation runs in `.github/workflows/ci.yml`.
 - The `build-test` matrix runs on `ubuntu-latest`, `macos-latest`, and `windows-latest`.
 - CI installs Zig `0.15.1` and runs `zig test src/main.zig -lc`.
+- CI runs `check:release-hygiene` to block tracked local auth files and obvious token literals.
+- CI also runs a Linux-only `package-host-smoke` job on `ubuntu-latest`.
+- That job builds the Linux x64 release binary, stages a temporary `artifacts/linux-x64/binary/codex-auth` tree, and runs `npm run check:release-host`.
+- The host smoke job validates version checks, npm staging, tarball packing, and smoke installation of the root package plus the Linux x64 package.
+- CI runs desktop checks on Linux and Windows, including bundled CLI staging for each host.
+- CI host smoke does not replace the full cross-platform packaging checks in preview and tag release workflows.
 
 ## Preview Packages for Pull Requests
 
@@ -80,6 +104,9 @@ This document describes the repository's CI, preview package publishing, and tag
 - Tag pushes matching `v*` run `.github/workflows/release.yml`.
 - The release workflow first validates the code with the same `build-test` matrix used by CI.
 - It then cross-builds release assets for the five supported targets on Ubuntu.
+- It builds desktop `.rpm` and AppImage artifacts on Ubuntu and the Windows x64 NSIS installer on Windows.
+- The `publish-npm` job reuses `npm run check:release-host` with the downloaded release artifacts before any npm publish step.
+- The GitHub Release includes CLI archives plus desktop `.rpm`, `.AppImage`, and `.exe` artifacts.
 - Release notes are generated from git tags and commit history.
 - GitHub releases are published automatically from the tag pipeline.
 - Stable tags create normal GitHub releases.

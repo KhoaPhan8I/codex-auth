@@ -16,16 +16,25 @@ import {
 function parseArgs(argv) {
   const options = {
     artifactsDir: path.resolve("artifacts"),
-    outputDir: path.resolve("dist", "npm")
+    outputDir: path.resolve("dist", "npm"),
+    platformIds: []
   };
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
+    const nextValue = argv[i + 1];
+    if ((arg === "--artifacts-dir" || arg === "--output-dir" || arg === "--platform") && nextValue === undefined) {
+      throw new Error(`Missing value for ${arg}`);
+    }
+
     if (arg === "--artifacts-dir") {
-      options.artifactsDir = path.resolve(argv[i + 1]);
+      options.artifactsDir = path.resolve(nextValue);
       i += 1;
     } else if (arg === "--output-dir") {
-      options.outputDir = path.resolve(argv[i + 1]);
+      options.outputDir = path.resolve(nextValue);
+      i += 1;
+    } else if (arg === "--platform") {
+      options.platformIds.push(nextValue);
       i += 1;
     } else {
       throw new Error(`Unknown argument: ${arg}`);
@@ -33,6 +42,29 @@ function parseArgs(argv) {
   }
 
   return options;
+}
+
+function selectPlatformPackages(platformIds) {
+  if (platformIds.length === 0) {
+    return platformPackages;
+  }
+
+  const selected = [];
+  const seenIds = new Set();
+
+  for (const platformId of platformIds) {
+    if (seenIds.has(platformId)) continue;
+
+    const pkg = platformPackages.find((candidate) => candidate.id === platformId);
+    if (!pkg) {
+      throw new Error(`Unknown platform id: ${platformId}`);
+    }
+
+    seenIds.add(platformId);
+    selected.push(pkg);
+  }
+
+  return selected;
 }
 
 function writeRootPackage(outputDir, rootPackage) {
@@ -76,10 +108,11 @@ function writePlatformPackage(outputDir, rootPackage, platformPackage, sourceBin
 
 const options = parseArgs(process.argv.slice(2));
 const rootPackage = readRootPackage();
+const selectedPlatformPackages = selectPlatformPackages(options.platformIds);
 fs.rmSync(options.outputDir, { recursive: true, force: true });
 writeRootPackage(options.outputDir, rootPackage);
 
-for (const pkg of platformPackages) {
+for (const pkg of selectedPlatformPackages) {
   const sourceBinary = path.join(options.artifactsDir, pkg.id, "binary", pkg.binaryName);
   if (!fs.existsSync(sourceBinary)) {
     throw new Error(`Missing binary for ${pkg.id}: ${sourceBinary}`);

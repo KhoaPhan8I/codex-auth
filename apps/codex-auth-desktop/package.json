@@ -1,0 +1,35 @@
+{
+  "name": "codex-auth-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "stage:bundled-cli": "node scripts/stage-bundled-cli.mjs",
+    "test:ui": "node scripts/run-ui-tests.mjs",
+    "build": "tsc && vite build",
+    "check": "npm run test:ui && npm run build && cargo test --manifest-path src-tauri/Cargo.toml --lib && cargo check --manifest-path src-tauri/Cargo.toml",
+    "audit": "npm run check && npm run tauri:build -- --debug --no-bundle && node scripts/smoke-debug.mjs",
+    "linux:check": "node scripts/check-linux.mjs",
+    "linux:package": "node scripts/package-linux.mjs",
+    "linux:install": "node scripts/install-linux-local.mjs",
+    "linux:uninstall": "node scripts/uninstall-linux-local.mjs",
+    "windows:check": "node scripts/check-windows.mjs",
+    "windows:package": "node scripts/package-windows.mjs",
+    "run:local": "node scripts/run-local.mjs",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-opener": "^2"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@types/node": "^24.5.2",
+    "vite": "^6.0.3",
+    "typescript": "~5.6.2"
+  }
+}

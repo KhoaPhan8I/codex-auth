@@ -1,4 +1,5 @@
 const std = @import("std");
+const auto = @import("../auto.zig");
 const registry = @import("../registry.zig");
 const bdd = @import("bdd_helpers.zig");
 
@@ -172,10 +173,11 @@ test "Scenario: Given unmatched active auth email when syncing then append accou
     try ctx.thenAccountAuthShouldMatchActive("new@example.com");
 }
 
-test "Scenario: Given accounts with different remaining usage when selecting best then highest remaining wins" {
+test "Scenario: Given accounts with different eligible headroom when selecting best then the highest remaining eligible account wins" {
     const gpa = std.testing.allocator;
     var reg = bdd.makeEmptyRegistry();
     defer reg.deinit(gpa);
+    const now = std.time.timestamp();
 
     try bdd.appendAccount(gpa, &reg, "low@example.com", "", null);
     try bdd.appendAccount(gpa, &reg, "high@example.com", "", null);
@@ -186,7 +188,7 @@ test "Scenario: Given accounts with different remaining usage when selecting bes
         .credits = null,
         .plan_type = null,
     };
-    reg.accounts.items[0].last_usage_at = 100;
+    reg.accounts.items[0].last_usage_at = now - 1;
 
     reg.accounts.items[1].last_usage = .{
         .primary = .{ .used_percent = 40.0, .window_minutes = 300, .resets_at = null },
@@ -194,17 +196,18 @@ test "Scenario: Given accounts with different remaining usage when selecting bes
         .credits = null,
         .plan_type = null,
     };
-    reg.accounts.items[1].last_usage_at = 50;
+    reg.accounts.items[1].last_usage_at = now;
 
-    const best = registry.selectBestAccountIndexByUsage(&reg);
+    const best = auto.bestEligibleAccountIndex(&reg);
     try std.testing.expect(best != null);
     try std.testing.expect(best.? == 1);
 }
 
-test "Scenario: Given equal usage when selecting best then most recent snapshot wins tie" {
+test "Scenario: Given equal eligible headroom when selecting best then most recent snapshot wins tie" {
     const gpa = std.testing.allocator;
     var reg = bdd.makeEmptyRegistry();
     defer reg.deinit(gpa);
+    const now = std.time.timestamp();
 
     try bdd.appendAccount(gpa, &reg, "older@example.com", "", null);
     try bdd.appendAccount(gpa, &reg, "newer@example.com", "", null);
@@ -215,7 +218,7 @@ test "Scenario: Given equal usage when selecting best then most recent snapshot 
         .credits = null,
         .plan_type = null,
     };
-    reg.accounts.items[0].last_usage_at = 100;
+    reg.accounts.items[0].last_usage_at = now - 1;
 
     reg.accounts.items[1].last_usage = .{
         .primary = .{ .used_percent = 50.0, .window_minutes = 300, .resets_at = null },
@@ -223,9 +226,48 @@ test "Scenario: Given equal usage when selecting best then most recent snapshot 
         .credits = null,
         .plan_type = null,
     };
-    reg.accounts.items[1].last_usage_at = 200;
+    reg.accounts.items[1].last_usage_at = now;
 
-    const best = registry.selectBestAccountIndexByUsage(&reg);
+    const best = auto.bestEligibleAccountIndex(&reg);
+    try std.testing.expect(best != null);
+    try std.testing.expect(best.? == 1);
+}
+
+test "Scenario: Given stale unknown and below-threshold accounts when selecting best then only fresh eligible quota is considered" {
+    const gpa = std.testing.allocator;
+    var reg = bdd.makeEmptyRegistry();
+    defer reg.deinit(gpa);
+
+    try bdd.appendAccount(gpa, &reg, "stale@example.com", "", null);
+    try bdd.appendAccount(gpa, &reg, "fresh@example.com", "", null);
+    try bdd.appendAccount(gpa, &reg, "low@example.com", "", null);
+    try bdd.appendAccount(gpa, &reg, "unknown@example.com", "", null);
+
+    reg.accounts.items[0].last_usage = .{
+        .primary = .{ .used_percent = 10.0, .window_minutes = 300, .resets_at = null },
+        .secondary = null,
+        .credits = null,
+        .plan_type = null,
+    };
+    reg.accounts.items[0].last_usage_at = std.time.timestamp() - (registry.local_snapshot_max_age_seconds + 10);
+
+    reg.accounts.items[1].last_usage = .{
+        .primary = .{ .used_percent = 45.0, .window_minutes = 300, .resets_at = null },
+        .secondary = null,
+        .credits = null,
+        .plan_type = null,
+    };
+    reg.accounts.items[1].last_usage_at = std.time.timestamp();
+
+    reg.accounts.items[2].last_usage = .{
+        .primary = .{ .used_percent = 95.0, .window_minutes = 300, .resets_at = null },
+        .secondary = .{ .used_percent = 10.0, .window_minutes = 10080, .resets_at = null },
+        .credits = null,
+        .plan_type = null,
+    };
+    reg.accounts.items[2].last_usage_at = std.time.timestamp();
+
+    const best = auto.bestEligibleAccountIndex(&reg);
     try std.testing.expect(best != null);
     try std.testing.expect(best.? == 1);
 }

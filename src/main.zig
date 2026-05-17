@@ -6,6 +6,7 @@ const registry = @import("registry.zig");
 const auth = @import("auth.zig");
 const auto = @import("auto.zig");
 const format = @import("format.zig");
+const warm = @import("warm.zig");
 
 const skip_service_reconcile_env = "CODEX_AUTH_SKIP_SERVICE_RECONCILE";
 const account_name_refresh_only_env = "CODEX_AUTH_REFRESH_ACCOUNT_NAMES_ONLY";
@@ -78,6 +79,7 @@ fn runMain() !void {
         .login => |opts| try handleLogin(allocator, codex_home.?, opts),
         .import_auth => |opts| try handleImport(allocator, codex_home.?, opts),
         .switch_account => |opts| try handleSwitch(allocator, codex_home.?, opts),
+        .warm => |opts| try handleWarm(allocator, codex_home.?, opts),
         .remove_account => |opts| try handleRemove(allocator, codex_home.?, opts),
         .clean => |_| try handleClean(allocator, codex_home.?),
     }
@@ -89,7 +91,10 @@ fn runMain() !void {
 
 fn isHandledCliError(err: anyerror) bool {
     return err == error.AccountNotFound or
+        err == error.NoKnownQuotaAccount or
+        err == error.ActiveAccountUnavailable or
         err == error.CodexLoginFailed or
+        err == error.SwitchCoordinatorBusy or
         err == error.RemoveConfirmationUnavailable or
         err == error.RemoveSelectionRequiresTty or
         err == error.InvalidRemoveSelectionInput;
@@ -135,6 +140,17 @@ fn clearStaleActiveAccountKey(allocator: std.mem.Allocator, reg: *registry.Regis
     reg.active_account_activated_at_ms = null;
 }
 
+fn replacementAccountIndex(
+    reg: *registry.Registry,
+    excluded_account_key: ?[]const u8,
+    excluded_indices: []const usize,
+) ?usize {
+    return switch (reg.auto_switch.mode) {
+        .pinned, .failover => auto.bestFreshKnownAccountIndexExcluding(reg, excluded_account_key, excluded_indices),
+        else => auto.bestEligibleAccountIndexExcluding(reg, excluded_account_key, excluded_indices),
+    };
+}
+
 pub fn reconcileActiveAuthAfterRemove(
     allocator: std.mem.Allocator,
     codex_home: []const u8,
@@ -144,8 +160,7 @@ pub fn reconcileActiveAuthAfterRemove(
     clearStaleActiveAccountKey(allocator, reg);
     if (reg.active_account_key != null) return;
 
-    if (reg.accounts.items.len > 0) {
-        const best_idx = registry.selectBestAccountIndexByUsage(reg) orelse 0;
+    if (replacementAccountIndex(reg, null, &.{})) |best_idx| {
         const account_key = reg.accounts.items[best_idx].account_key;
         if (allow_auth_file_update) {
             try registry.replaceActiveAuthWithAccountByKey(allocator, codex_home, reg, account_key);
@@ -481,6 +496,9 @@ fn handleList(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.Li
         try registry.saveRegistry(allocator, codex_home, &reg);
     }
     try maybeRefreshForegroundUsage(allocator, codex_home, &reg, .list);
+    if (try auto.refreshBestSwitchCandidatesForForeground(allocator, codex_home, &reg)) {
+        try registry.saveRegistry(allocator, codex_home, &reg);
+    }
     try format.printAccounts(&reg);
     maybeSpawnBackgroundAccountNameRefresh(allocator, &reg);
 }
@@ -548,15 +566,38 @@ fn handleImport(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.
 }
 
 fn handleSwitch(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.SwitchOptions) !void {
+    try registry.ensureAccountsDir(allocator, codex_home);
+    var switch_lock = (try auto.SwitchCoordinatorLock.acquire(allocator, codex_home)) orelse {
+        std.debug.print("another account switch is already in progress; try again.\n", .{});
+        return error.SwitchCoordinatorBusy;
+    };
+    defer switch_lock.release();
+
     var reg = try registry.loadRegistry(allocator, codex_home);
     defer reg.deinit(allocator);
     if (try registry.syncActiveAccountFromAuth(allocator, codex_home, &reg)) {
         try registry.saveRegistry(allocator, codex_home, &reg);
     }
     try maybeRefreshForegroundUsage(allocator, codex_home, &reg, .switch_account);
+    if (opts.best and (try auto.refreshBestSwitchCandidatesForForeground(allocator, codex_home, &reg))) {
+        try registry.saveRegistry(allocator, codex_home, &reg);
+    }
 
     var selected_account_key: ?[]const u8 = null;
-    if (opts.query) |query| {
+    if (opts.best) {
+        const best_idx = try selectBestSwitchAccountIndex(allocator, codex_home, &reg) orelse {
+            try registry.saveRegistry(allocator, codex_home, &reg);
+            try cli.printNoKnownQuotaAccountError();
+            return error.NoKnownQuotaAccount;
+        };
+        selected_account_key = reg.accounts.items[best_idx].account_key;
+    } else if (opts.account_key) |account_key| {
+        const selected_idx = registry.findAccountIndexByAccountKey(&reg, account_key) orelse {
+            try cli.printAccountNotFoundError(account_key);
+            return error.AccountNotFound;
+        };
+        selected_account_key = reg.accounts.items[selected_idx].account_key;
+    } else if (opts.query) |query| {
         var matches = try findMatchingAccounts(allocator, &reg, query);
         defer matches.deinit(allocator);
 
@@ -578,9 +619,61 @@ fn handleSwitch(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.
     }
     const account_key = selected_account_key.?;
 
+    registry.validateAccountSnapshotForAccount(allocator, codex_home, &reg, account_key) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            try registry.saveRegistry(allocator, codex_home, &reg);
+            return err;
+        },
+    };
+    if (opts.best) {
+        try registry.saveRegistry(allocator, codex_home, &reg);
+    }
+
+    if (reg.active_account_key) |active_key| {
+        if (std.mem.eql(u8, active_key, account_key)) {
+            var current_auth_state = try loadCurrentAuthState(allocator, codex_home);
+            defer current_auth_state.deinit(allocator);
+            if (currentAuthMatchesAccount(&current_auth_state, account_key)) {
+                if (reg.auto_switch.mode == .pinned) {
+                    try registry.setPinnedAccountKey(allocator, &reg, account_key);
+                    try registry.saveRegistry(allocator, codex_home, &reg);
+                }
+                return;
+            }
+        }
+    }
+
     try registry.activateAccountByKey(allocator, codex_home, &reg, account_key);
+    if (reg.auto_switch.mode == .pinned) {
+        try registry.setPinnedAccountKey(allocator, &reg, account_key);
+    }
     try registry.saveRegistry(allocator, codex_home, &reg);
     maybeSpawnBackgroundAccountNameRefresh(allocator, &reg);
+}
+
+fn selectBestSwitchAccountIndex(
+    allocator: std.mem.Allocator,
+    codex_home: []const u8,
+    reg: *registry.Registry,
+) !?usize {
+    var excluded = std.ArrayList(usize).empty;
+    defer excluded.deinit(allocator);
+
+    while (excluded.items.len < reg.accounts.items.len) {
+        const best_idx = auto.bestFreshKnownAccountIndexExcluding(reg, null, excluded.items) orelse return null;
+        const account_key = reg.accounts.items[best_idx].account_key;
+        registry.validateAccountSnapshotForAccount(allocator, codex_home, reg, account_key) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try excluded.append(allocator, best_idx);
+                continue;
+            },
+        };
+        return best_idx;
+    }
+
+    return null;
 }
 
 fn handleConfig(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.ConfigOptions) !void {
@@ -588,6 +681,60 @@ fn handleConfig(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.
         .auto_switch => |auto_opts| try auto.handleAutoCommand(allocator, codex_home, auto_opts),
         .api => |action| try auto.handleApiCommand(allocator, codex_home, action),
     }
+}
+
+fn handleWarm(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.WarmOptions) !void {
+    var reg = try registry.loadRegistry(allocator, codex_home);
+    defer reg.deinit(allocator);
+    if (try registry.syncActiveAccountFromAuth(allocator, codex_home, &reg)) {
+        try registry.saveRegistry(allocator, codex_home, &reg);
+    }
+
+    var target_indices = std.ArrayList(usize).empty;
+    defer target_indices.deinit(allocator);
+
+    if (opts.all) {
+        for (reg.accounts.items, 0..) |_, idx| {
+            try target_indices.append(allocator, idx);
+        }
+    } else if (opts.account_key) |account_key| {
+        const selected_idx = registry.findAccountIndexByAccountKey(&reg, account_key) orelse {
+            try cli.printAccountNotFoundError(account_key);
+            return error.AccountNotFound;
+        };
+        try target_indices.append(allocator, selected_idx);
+    } else if (opts.query) |query| {
+        var matches = try findMatchingAccounts(allocator, &reg, query);
+        defer matches.deinit(allocator);
+
+        if (matches.items.len == 0) {
+            try cli.printAccountNotFoundError(query);
+            return error.AccountNotFound;
+        }
+
+        const selected_account_key = if (matches.items.len == 1)
+            reg.accounts.items[matches.items[0]].account_key
+        else
+            (try cli.selectAccountFromIndices(allocator, &reg, matches.items)) orelse return;
+        const selected_idx = registry.findAccountIndexByAccountKey(&reg, selected_account_key) orelse
+            return error.AccountNotFound;
+        try target_indices.append(allocator, selected_idx);
+    } else {
+        const account_key = reg.active_account_key orelse {
+            try cli.printNoActiveAccountError("warm");
+            return error.ActiveAccountUnavailable;
+        };
+        const active_idx = registry.findAccountIndexByAccountKey(&reg, account_key) orelse {
+            try cli.printNoActiveAccountError("warm");
+            return error.ActiveAccountUnavailable;
+        };
+        try target_indices.append(allocator, active_idx);
+    }
+
+    var summary = try warm.run(allocator, codex_home, &reg, target_indices.items);
+    defer summary.deinit(allocator);
+    try registry.saveRegistry(allocator, codex_home, &reg);
+    try warm.printSummary(&summary);
 }
 
 fn freeOwnedStrings(allocator: std.mem.Allocator, items: []const []const u8) void {
@@ -656,48 +803,17 @@ fn loadCurrentAuthState(allocator: std.mem.Allocator, codex_home: []const u8) !C
     };
 }
 
+fn currentAuthMatchesAccount(state: *const CurrentAuthState, account_key: []const u8) bool {
+    const record_key = state.record_key orelse return false;
+    return state.syncable and std.mem.eql(u8, record_key, account_key);
+}
+
 fn selectionContainsAccountKey(reg: *registry.Registry, indices: []const usize, account_key: []const u8) bool {
     for (indices) |idx| {
         if (idx >= reg.accounts.items.len) continue;
         if (std.mem.eql(u8, reg.accounts.items[idx].account_key, account_key)) return true;
     }
     return false;
-}
-
-fn selectionContainsIndex(indices: []const usize, target: usize) bool {
-    for (indices) |idx| {
-        if (idx == target) return true;
-    }
-    return false;
-}
-
-fn selectBestRemainingAccountKeyByUsageAlloc(
-    allocator: std.mem.Allocator,
-    reg: *registry.Registry,
-    removed_indices: []const usize,
-) !?[]u8 {
-    if (reg.accounts.items.len == 0) return null;
-
-    const now = std.time.timestamp();
-    var best_idx: ?usize = null;
-    var best_score: i64 = -2;
-    var best_seen: i64 = -1;
-    for (reg.accounts.items, 0..) |rec, idx| {
-        if (selectionContainsIndex(removed_indices, idx)) continue;
-
-        const score = registry.usageScoreAt(rec.last_usage, now) orelse -1;
-        const seen = rec.last_usage_at orelse -1;
-        if (score > best_score or (score == best_score and seen > best_seen)) {
-            best_idx = idx;
-            best_score = score;
-            best_seen = seen;
-        }
-    }
-
-    if (best_idx) |idx| {
-        return try allocator.dupe(u8, reg.accounts.items[idx].account_key);
-    }
-    return null;
 }
 
 fn handleRemove(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.RemoveOptions) !void {
@@ -713,6 +829,13 @@ fn handleRemove(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.
     if (opts.all) {
         selected = try allocator.alloc(usize, reg.accounts.items.len);
         for (selected.?, 0..) |*slot, idx| slot.* = idx;
+    } else if (opts.account_key) |account_key| {
+        const idx = registry.findAccountIndexByAccountKey(&reg, account_key) orelse {
+            try cli.printAccountNotFoundError(account_key);
+            return error.AccountNotFound;
+        };
+        selected = try allocator.alloc(usize, 1);
+        selected.?[0] = idx;
     } else if (opts.query) |query| {
         var matches = try findMatchingAccounts(allocator, &reg, query);
         defer matches.deinit(allocator);
@@ -779,10 +902,12 @@ fn handleRemove(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.
     else
         false;
 
-    const replacement_account_key = if (active_removed)
-        try selectBestRemainingAccountKeyByUsageAlloc(allocator, &reg, selected.?)
-    else
-        null;
+    const replacement_account_key = if (active_removed) blk: {
+        if (replacementAccountIndex(&reg, null, selected.?)) |best_idx| {
+            break :blk try allocator.dupe(u8, reg.accounts.items[best_idx].account_key);
+        }
+        break :blk null;
+    } else null;
     defer if (replacement_account_key) |key| allocator.free(key);
 
     if (replacement_account_key) |key| {
@@ -870,6 +995,7 @@ test {
     _ = @import("tests/cli_bdd_test.zig");
     _ = @import("tests/display_rows_test.zig");
     _ = @import("tests/main_test.zig");
+    _ = @import("tests/warm_test.zig");
     _ = @import("tests/purge_test.zig");
     _ = @import("tests/e2e_cli_test.zig");
 }

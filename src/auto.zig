@@ -23,18 +23,56 @@ const windows_task_restart_count = "999";
 const windows_task_restart_interval_xml = "PT1M";
 const windows_task_execution_time_limit_xml = "PT0S";
 const lock_file_name = "auto-switch.lock";
+const switch_lock_file_name = "switch-coordinator.lock";
 const watch_poll_interval_ns = 1 * std.time.ns_per_s;
 const api_refresh_interval_ns = 60 * std.time.ns_per_s;
 const free_plan_realtime_guard_5h_percent: i64 = 35;
+const failover_queue_dir_name = "failover-events";
+const failover_pending_dir_name = "pending";
+const failover_processing_dir_name = "processing";
+const failover_done_dir_name = "done";
 pub const RuntimeState = enum { running, stopped, unknown };
+pub const ActiveAuthState = enum { ready, missing, malformed, untracked, api_key };
+pub const PinState = enum { none, ready, missing_snapshot, out_of_sync, low, exhausted };
 
 pub const Status = struct {
     enabled: bool,
+    selection_mode: registry.AutoSwitchMode = .reactive,
     runtime: RuntimeState,
     threshold_5h_percent: u8,
     threshold_weekly_percent: u8,
     api_usage_enabled: bool,
     api_account_enabled: bool,
+    active_auth: ActiveAuthState = .missing,
+    active_account_label: ?[]u8 = null,
+    active_account_key: ?[]u8 = null,
+    registry_active_label: ?[]u8 = null,
+    registry_active_out_of_sync: bool = false,
+    pinned_account_label: ?[]u8 = null,
+    pin_state: ?PinState = null,
+    failover_state: ?registry.FailoverState = null,
+    blocked_account_label: ?[]u8 = null,
+    blocked_until_ms: ?i64 = null,
+    known_snapshots: usize = 0,
+    total_accounts: usize = 0,
+    eligible_candidates: usize = 0,
+
+    pub fn deinit(self: *Status, allocator: std.mem.Allocator) void {
+        if (self.active_account_label) |label| allocator.free(label);
+        if (self.active_account_key) |key| allocator.free(key);
+        if (self.registry_active_label) |label| allocator.free(label);
+        if (self.pinned_account_label) |label| allocator.free(label);
+        if (self.blocked_account_label) |label| allocator.free(label);
+        self.active_account_label = null;
+        self.active_account_key = null;
+        self.registry_active_label = null;
+        self.pinned_account_label = null;
+        self.blocked_account_label = null;
+        self.registry_active_out_of_sync = false;
+        self.pin_state = null;
+        self.failover_state = null;
+        self.blocked_until_ms = null;
+    }
 };
 
 const service_version_env_name = "CODEX_AUTH_VERSION";
@@ -46,13 +84,22 @@ pub const AutoSwitchAttempt = struct {
 };
 
 const CandidateScore = struct {
-    value: i64,
+    effective_remaining: i64,
+    weekly_remaining: i64,
+    effective_resets_at: i64,
     last_usage_at: i64,
-    created_at: i64,
+    last_used_at: i64,
+    refresh_only: bool,
+    alias: []const u8,
+    email: []const u8,
+    account_key: []const u8,
 };
 
 const candidate_upkeep_refresh_limit: usize = 1;
 const candidate_switch_validation_limit: usize = 3;
+const candidate_parallel_fetch_limit: usize = 2;
+const account_name_parallel_fetch_limit: usize = 2;
+const worker_fetch_allocator = std.heap.c_allocator;
 
 const CandidateEntry = struct {
     account_key: []const u8,
@@ -77,9 +124,11 @@ const CandidateIndex = struct {
             if (active) |account_key| {
                 if (std.mem.eql(u8, rec.account_key, account_key)) continue;
             }
+            if (accountIsBlocked(reg, rec.account_key, now)) continue;
+            const score = daemonCandidateScore(rec, reg, now) orelse continue;
             try self.insert(allocator, .{
                 .account_key = rec.account_key,
-                .score = candidateScore(rec, now),
+                .score = score,
             });
         }
         self.refreshNextScoreChangeAt(reg, now);
@@ -134,15 +183,25 @@ const CandidateIndex = struct {
                 return;
             }
         }
+        if (accountIsBlocked(reg, account_key, now)) {
+            self.remove(account_key);
+            self.refreshNextScoreChangeAt(reg, now);
+            return;
+        }
 
         const idx = registry.findAccountIndexByAccountKey(reg, account_key) orelse {
             self.remove(account_key);
             self.refreshNextScoreChangeAt(reg, now);
             return;
         };
+        const score = daemonCandidateScore(&reg.accounts.items[idx], reg, now) orelse {
+            self.remove(account_key);
+            self.refreshNextScoreChangeAt(reg, now);
+            return;
+        };
         const entry: CandidateEntry = .{
             .account_key = reg.accounts.items[idx].account_key,
-            .score = candidateScore(&reg.accounts.items[idx], now),
+            .score = score,
         };
         if (self.positions.get(entry.account_key)) |heap_idx| {
             self.heap.items[heap_idx] = entry;
@@ -173,9 +232,10 @@ const CandidateIndex = struct {
             if (active) |account_key| {
                 if (std.mem.eql(u8, rec.account_key, account_key)) continue;
             }
+            if (accountIsBlocked(reg, rec.account_key, now)) continue;
             next_score_change_at = earlierFutureTimestamp(
                 next_score_change_at,
-                candidateScoreChangeAt(rec.last_usage, now),
+                candidateScoreChangeAt(rec, now),
                 now,
             );
         }
@@ -196,7 +256,7 @@ const CandidateIndex = struct {
         const right_idx = self.positions.get(rhs) orelse return false;
         const left = self.heap.items[left_idx].score;
         const right = self.heap.items[right_idx].score;
-        return candidateBetter(left, right);
+        return candidateRefreshBetter(left, right);
     }
 
     fn restore(self: *CandidateIndex, idx: usize) void {
@@ -210,7 +270,7 @@ const CandidateIndex = struct {
         var moved = false;
         while (idx > 0) {
             const parent_idx = (idx - 1) / 2;
-            if (!candidateBetter(self.heap.items[idx].score, self.heap.items[parent_idx].score)) break;
+            if (!candidateRefreshBetter(self.heap.items[idx].score, self.heap.items[parent_idx].score)) break;
             self.swap(idx, parent_idx);
             idx = parent_idx;
             moved = true;
@@ -225,10 +285,10 @@ const CandidateIndex = struct {
             if (left >= self.heap.items.len) break;
             const right = left + 1;
             var best_idx = left;
-            if (right < self.heap.items.len and candidateBetter(self.heap.items[right].score, self.heap.items[left].score)) {
+            if (right < self.heap.items.len and candidateRefreshBetter(self.heap.items[right].score, self.heap.items[left].score)) {
                 best_idx = right;
             }
-            if (!candidateBetter(self.heap.items[best_idx].score, self.heap.items[idx].score)) break;
+            if (!candidateRefreshBetter(self.heap.items[best_idx].score, self.heap.items[idx].score)) break;
             self.swap(idx, best_idx);
             idx = best_idx;
         }
@@ -492,6 +552,27 @@ const DaemonLock = struct {
     }
 };
 
+pub const SwitchCoordinatorLock = struct {
+    file: std.fs.File,
+
+    pub fn acquire(allocator: std.mem.Allocator, codex_home: []const u8) !?SwitchCoordinatorLock {
+        const path = try std.fs.path.join(allocator, &[_][]const u8{ codex_home, "accounts", switch_lock_file_name });
+        defer allocator.free(path);
+        var file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = false });
+        errdefer file.close();
+        if (!(try tryExclusiveLock(file))) {
+            file.close();
+            return null;
+        }
+        return .{ .file = file };
+    }
+
+    pub fn release(self: *SwitchCoordinatorLock) void {
+        self.file.unlock();
+        self.file.close();
+    }
+};
+
 fn tryExclusiveLock(file: std.fs.File) !bool {
     if (builtin.os.tag == .windows) {
         const windows = std.os.windows;
@@ -528,7 +609,8 @@ fn colorEnabled() bool {
 }
 
 pub fn printStatus(allocator: std.mem.Allocator, codex_home: []const u8) !void {
-    const status = try getStatus(allocator, codex_home);
+    var status = try getStatus(allocator, codex_home);
+    defer status.deinit(allocator);
     var stdout: io_util.Stdout = undefined;
     stdout.init();
     try writeStatusWithColor(stdout.out(), status, colorEnabled());
@@ -537,14 +619,43 @@ pub fn printStatus(allocator: std.mem.Allocator, codex_home: []const u8) !void {
 pub fn getStatus(allocator: std.mem.Allocator, codex_home: []const u8) !Status {
     var reg = try registry.loadRegistry(allocator, codex_home);
     defer reg.deinit(allocator);
-    return .{
+    _ = try normalizeBlockedAccountState(allocator, &reg, std.time.timestamp());
+    var status: Status = .{
         .enabled = reg.auto_switch.enabled,
+        .selection_mode = reg.auto_switch.mode,
         .runtime = queryRuntimeState(allocator),
         .threshold_5h_percent = reg.auto_switch.threshold_5h_percent,
         .threshold_weekly_percent = reg.auto_switch.threshold_weekly_percent,
         .api_usage_enabled = reg.api.usage,
         .api_account_enabled = reg.api.account,
     };
+    errdefer status.deinit(allocator);
+    const auth_active_key = try populateActiveAuthStatus(allocator, codex_home, &reg, &status);
+    const active_key = auth_active_key orelse reg.active_account_key;
+    const now = std.time.timestamp();
+    if (reg.auto_switch.mode == .pinned) {
+        try populatePinnedStatus(allocator, &reg, &status, auth_active_key, now);
+    } else if (reg.auto_switch.mode == .failover) {
+        try populateFailoverStatus(allocator, &reg, &status, now);
+    }
+    var known_snapshots: usize = 0;
+    var eligible_candidates: usize = 0;
+    for (reg.accounts.items) |*rec| {
+        if (registry.accountSnapshotFreshness(rec, now) == .fresh) {
+            known_snapshots += 1;
+        }
+        if (active_key) |excluded| {
+            if (std.mem.eql(u8, rec.account_key, excluded)) continue;
+        }
+        if (accountIsBlocked(&reg, rec.account_key, now)) continue;
+        if (candidateScore(rec, reg.auto_switch, now) != null) {
+            eligible_candidates += 1;
+        }
+    }
+    status.known_snapshots = known_snapshots;
+    status.total_accounts = reg.accounts.items.len;
+    status.eligible_candidates = eligible_candidates;
+    return status;
 }
 
 pub fn writeStatus(out: *std.Io.Writer, status: Status) !void {
@@ -572,11 +683,296 @@ fn writeStatusWithColor(out: *std.Io.Writer, status: Status, use_color: bool) !v
     try out.writeAll(if (status.api_usage_enabled) "api" else "local");
     try out.writeAll("\n");
 
-    try out.writeAll("account: ");
+    try out.writeAll("account API: ");
     try out.writeAll(if (status.api_account_enabled) "api" else "disabled");
     try out.writeAll("\n");
 
+    try out.writeAll("active auth: ");
+    try out.writeAll(activeAuthStateLabel(status.active_auth));
+    try out.writeAll("\n");
+
+    try out.writeAll("active account: ");
+    try out.writeAll(status.active_account_label orelse "none");
+    try out.writeAll("\n");
+
+    try out.writeAll("active account key: ");
+    try out.writeAll(status.active_account_key orelse "none");
+    try out.writeAll("\n");
+
+    if (status.registry_active_out_of_sync) {
+        try out.writeAll("registry active: ");
+        try out.writeAll(status.registry_active_label orelse "none");
+        try out.writeAll(" (out of sync)\n");
+    }
+
+    try out.writeAll("selection: ");
+    try out.writeAll(selectionLabel(status.selection_mode));
+    try out.writeAll("\n");
+
+    if (status.selection_mode == .pinned) {
+        try out.writeAll("pinned account: ");
+        try out.writeAll(status.pinned_account_label orelse "none");
+        try out.writeAll("\n");
+
+        try out.writeAll("pin state: ");
+        try out.writeAll(pinStateLabel(status.pin_state orelse .none));
+        try out.writeAll("\n");
+    }
+    if (status.selection_mode == .failover) {
+        try out.writeAll("failover state: ");
+        try out.writeAll(failoverStateLabel(status.failover_state orelse .idle));
+        try out.writeAll("\n");
+
+        try out.writeAll("blocked account: ");
+        try out.writeAll(status.blocked_account_label orelse "none");
+        try out.writeAll("\n");
+
+        try out.writeAll("blocked until: ");
+        if (status.blocked_account_label == null) {
+            try out.writeAll("none");
+        } else if (status.blocked_until_ms) |blocked_until_ms| {
+            var blocked_until_buf: [19]u8 = undefined;
+            try out.writeAll(localDateTimeLabel(&blocked_until_buf, blocked_until_ms));
+        } else {
+            try out.writeAll("unknown");
+        }
+        try out.writeAll("\n");
+    }
+
+    try out.writeAll("usage source mode: ");
+    try out.writeAll(if (status.api_usage_enabled) "api" else "local-only");
+    try out.writeAll("\n");
+
+    try out.print(
+        "known snapshots: {d}/{d}\n",
+        .{ status.known_snapshots, status.total_accounts },
+    );
+    try out.print("eligible candidates: {d}\n", .{status.eligible_candidates});
+
     try out.flush();
+}
+
+fn activeAuthStateLabel(state: ActiveAuthState) []const u8 {
+    return switch (state) {
+        .ready => "ready",
+        .missing => "missing",
+        .malformed => "malformed",
+        .untracked => "untracked",
+        .api_key => "api-key",
+    };
+}
+
+fn selectionLabel(mode: registry.AutoSwitchMode) []const u8 {
+    return switch (mode) {
+        .reactive => "reactive-best-snapshot",
+        .proactive => "proactive-best-snapshot",
+        .pinned => "pinned-best-known",
+        .failover => "failover-on-rate-limit",
+    };
+}
+
+fn pinStateLabel(state: PinState) []const u8 {
+    return switch (state) {
+        .none => "none",
+        .ready => "ready",
+        .missing_snapshot => "missing-snapshot",
+        .out_of_sync => "out-of-sync",
+        .low => "low",
+        .exhausted => "exhausted",
+    };
+}
+
+fn failoverStateLabel(state: registry.FailoverState) []const u8 {
+    return switch (state) {
+        .idle => "idle",
+        .processing => "processing",
+        .switched => "switched",
+        .no_target => "no-target",
+        .stale_event => "stale-event",
+        .@"error" => "error",
+    };
+}
+
+fn populateActiveAuthStatus(
+    allocator: std.mem.Allocator,
+    codex_home: []const u8,
+    reg: *const registry.Registry,
+    status: *Status,
+) !?[]const u8 {
+    const auth_path = try registry.activeAuthPath(allocator, codex_home);
+    defer allocator.free(auth_path);
+
+    var info = auth.parseAuthInfo(allocator, auth_path) catch |err| switch (err) {
+        error.FileNotFound => {
+            status.active_auth = .missing;
+            try maybeSetRegistryActiveOutOfSync(allocator, reg, status);
+            return null;
+        },
+        error.OutOfMemory => return err,
+        else => {
+            status.active_auth = .malformed;
+            try maybeSetRegistryActiveOutOfSync(allocator, reg, status);
+            return null;
+        },
+    };
+    defer info.deinit(allocator);
+
+    switch (info.auth_mode) {
+        .apikey => {
+            status.active_auth = .api_key;
+            status.active_account_label = try allocator.dupe(u8, "api-key");
+            try maybeSetRegistryActiveOutOfSync(allocator, reg, status);
+            return null;
+        },
+        .chatgpt => {
+            const email = info.email orelse {
+                status.active_auth = .malformed;
+                try maybeSetRegistryActiveOutOfSync(allocator, reg, status);
+                return null;
+            };
+            const record_key = info.record_key orelse {
+                status.active_auth = .malformed;
+                try maybeSetRegistryActiveOutOfSync(allocator, reg, status);
+                return null;
+            };
+
+            if (registry.findAccountIndexByAccountKey(@constCast(reg), record_key)) |idx| {
+                status.active_auth = .ready;
+                status.active_account_label = try allocator.dupe(u8, reg.accounts.items[idx].email);
+                status.active_account_key = try allocator.dupe(u8, reg.accounts.items[idx].account_key);
+                if (reg.active_account_key) |active_account_key| {
+                    if (!std.mem.eql(u8, active_account_key, record_key)) {
+                        try maybeSetRegistryActiveOutOfSync(allocator, reg, status);
+                    }
+                }
+                return reg.accounts.items[idx].account_key;
+            }
+
+            status.active_auth = .untracked;
+            status.active_account_label = try allocator.dupe(u8, email);
+            try maybeSetRegistryActiveOutOfSync(allocator, reg, status);
+            return null;
+        },
+    }
+}
+
+fn maybeSetRegistryActiveOutOfSync(
+    allocator: std.mem.Allocator,
+    reg: *const registry.Registry,
+    status: *Status,
+) !void {
+    const active_account_key = reg.active_account_key orelse return;
+    status.registry_active_out_of_sync = true;
+    status.registry_active_label = try registryAccountLabelAlloc(allocator, reg, active_account_key);
+}
+
+fn populatePinnedStatus(
+    allocator: std.mem.Allocator,
+    reg: *const registry.Registry,
+    status: *Status,
+    auth_active_key: ?[]const u8,
+    now: i64,
+) !void {
+    const pinned_key = reg.auto_switch.pinned_account_key orelse {
+        status.pin_state = .none;
+        return;
+    };
+    const pinned_idx = registry.findAccountIndexByAccountKey(@constCast(reg), pinned_key) orelse {
+        status.pin_state = .none;
+        return;
+    };
+    const rec = &reg.accounts.items[pinned_idx];
+    status.pinned_account_label = try allocator.dupe(u8, rec.email);
+
+    if (auth_active_key == null or !std.mem.eql(u8, auth_active_key.?, pinned_key)) {
+        status.pin_state = .out_of_sync;
+        return;
+    }
+
+    const headroom = rankedHeadroom(rec, now) orelse {
+        status.pin_state = .missing_snapshot;
+        return;
+    };
+    const resolved_5h = resolve5hCandidateWindow(rec.last_usage);
+    const weekly_window = registry.resolveRateWindow(rec.last_usage, 10080, false);
+    const rem_5h = registry.remainingPercentAt(resolved_5h.window, now);
+    const rem_week = registry.remainingPercentAt(weekly_window, now);
+    if ((rem_5h != null and rem_5h.? <= 0) or
+        (rem_week != null and rem_week.? <= 0) or
+        headroom.effective_remaining <= 0)
+    {
+        status.pin_state = .exhausted;
+        return;
+    }
+    if (candidateScore(rec, reg.auto_switch, now) == null) {
+        status.pin_state = .low;
+        return;
+    }
+    status.pin_state = .ready;
+}
+
+fn blockedAccountStillApplies(
+    reg: *const registry.Registry,
+    rec: *const registry.AccountRecord,
+    now: i64,
+) bool {
+    if (reg.auto_switch.blocked_until_ms) |blocked_until_ms| {
+        return std.time.milliTimestamp() < blocked_until_ms;
+    }
+    if (rankedHeadroom(rec, now)) |headroom| {
+        return headroom.effective_remaining <= 0;
+    }
+    return true;
+}
+
+fn activeBlockedAccountKey(reg: *const registry.Registry, now: i64) ?[]const u8 {
+    const blocked_key = reg.auto_switch.blocked_account_key orelse return null;
+    const blocked_idx = registry.findAccountIndexByAccountKey(@constCast(reg), blocked_key) orelse return null;
+    const rec = &reg.accounts.items[blocked_idx];
+    if (!blockedAccountStillApplies(reg, rec, now)) return null;
+    return rec.account_key;
+}
+
+fn accountIsBlocked(reg: *const registry.Registry, account_key: []const u8, now: i64) bool {
+    const blocked_key = activeBlockedAccountKey(reg, now) orelse return false;
+    return std.mem.eql(u8, blocked_key, account_key);
+}
+
+fn normalizeBlockedAccountState(
+    allocator: std.mem.Allocator,
+    reg: *registry.Registry,
+    now: i64,
+) !bool {
+    if (reg.auto_switch.blocked_account_key == null) return false;
+    if (activeBlockedAccountKey(reg, now) != null) return false;
+    try registry.setBlockedAccount(allocator, reg, null, null);
+    if (reg.auto_switch.failover_state == .processing) {
+        reg.auto_switch.failover_state = .idle;
+    }
+    return true;
+}
+
+fn populateFailoverStatus(
+    allocator: std.mem.Allocator,
+    reg: *const registry.Registry,
+    status: *Status,
+    now: i64,
+) !void {
+    status.failover_state = reg.auto_switch.failover_state;
+    const blocked_key = activeBlockedAccountKey(reg, now) orelse return;
+    status.blocked_account_label = try registryAccountLabelAlloc(allocator, reg, blocked_key);
+    status.blocked_until_ms = reg.auto_switch.blocked_until_ms;
+}
+
+fn registryAccountLabelAlloc(
+    allocator: std.mem.Allocator,
+    reg: *const registry.Registry,
+    account_key: []const u8,
+) ![]u8 {
+    if (registry.findAccountIndexByAccountKey(@constCast(reg), account_key)) |idx| {
+        return allocator.dupe(u8, reg.accounts.items[idx].email);
+    }
+    return allocator.dupe(u8, account_key);
 }
 
 pub fn writeAutoSwitchLogLine(
@@ -668,17 +1064,259 @@ fn localtimeCompat(ts: i64, out_tm: *c_time.struct_tm) bool {
     if (comptime @hasDecl(c_time, "localtime_r")) {
         return c_time.localtime_r(&t, out_tm) != null;
     }
-
     if (comptime @hasDecl(c_time, "localtime")) {
         const tm_ptr = c_time.localtime(&t);
         if (tm_ptr == null) return false;
         out_tm.* = tm_ptr.*;
         return true;
     }
-
     return false;
 }
 
+const FailoverEventKind = enum {
+    usage_limit_reached,
+    quota_exceeded,
+    usage_not_included,
+};
+
+const FailoverEventWindow = struct {
+    used_percent: f64,
+    window_minutes: ?i64 = null,
+    resets_at: ?i64 = null,
+};
+
+const FailoverEventCredits = struct {
+    has_credits: bool,
+    unlimited: bool,
+    balance: ?[]u8 = null,
+
+    fn deinit(self: *FailoverEventCredits, allocator: std.mem.Allocator) void {
+        if (self.balance) |balance| allocator.free(balance);
+        self.balance = null;
+    }
+};
+
+const FailoverEventRateLimits = struct {
+    primary: ?FailoverEventWindow = null,
+    secondary: ?FailoverEventWindow = null,
+    credits: ?FailoverEventCredits = null,
+
+    fn deinit(self: *FailoverEventRateLimits, allocator: std.mem.Allocator) void {
+        if (self.credits) |*credits| credits.deinit(allocator);
+        self.credits = null;
+    }
+};
+
+const FailoverEventFile = struct {
+    version: u32 = 1,
+    event_id: []u8,
+    occurred_at_ms: i64,
+    source: []u8,
+    thread_id: []u8,
+    turn_id: []u8,
+    source_auth_mode: []u8,
+    source_email: ?[]u8 = null,
+    source_account_id: ?[]u8 = null,
+    source_record_key: ?[]u8 = null,
+    error_kind: FailoverEventKind,
+    resets_at_ms: ?i64 = null,
+    rate_limits: ?FailoverEventRateLimits = null,
+
+    fn deinit(self: *FailoverEventFile, allocator: std.mem.Allocator) void {
+        allocator.free(self.event_id);
+        allocator.free(self.source);
+        allocator.free(self.thread_id);
+        allocator.free(self.turn_id);
+        allocator.free(self.source_auth_mode);
+        if (self.source_email) |value| allocator.free(value);
+        if (self.source_account_id) |value| allocator.free(value);
+        if (self.source_record_key) |value| allocator.free(value);
+        if (self.rate_limits) |*rate_limits| rate_limits.deinit(allocator);
+        self.source_email = null;
+        self.source_account_id = null;
+        self.source_record_key = null;
+        self.rate_limits = null;
+    }
+};
+
+const ClaimedFailoverEvent = struct {
+    file_name: []u8,
+    processing_path: []u8,
+    done_path: []u8,
+
+    fn deinit(self: *ClaimedFailoverEvent, allocator: std.mem.Allocator) void {
+        allocator.free(self.file_name);
+        allocator.free(self.processing_path);
+        allocator.free(self.done_path);
+    }
+};
+
+fn failoverQueueBaseDirPath(allocator: std.mem.Allocator, codex_home: []const u8) ![]u8 {
+    const parts = [_][]const u8{
+        codex_home,
+        "runtime",
+        failover_queue_dir_name,
+    };
+    return try std.fs.path.join(allocator, &parts);
+}
+
+fn failoverQueueDirPath(allocator: std.mem.Allocator, codex_home: []const u8, subdir: []const u8) ![]u8 {
+    const parts = [_][]const u8{
+        codex_home,
+        "runtime",
+        failover_queue_dir_name,
+        subdir,
+    };
+    return try std.fs.path.join(allocator, &parts);
+}
+
+fn failoverQueueFilePath(
+    allocator: std.mem.Allocator,
+    codex_home: []const u8,
+    subdir: []const u8,
+    file_name: []const u8,
+) ![]u8 {
+    const parts = [_][]const u8{
+        codex_home,
+        "runtime",
+        failover_queue_dir_name,
+        subdir,
+        file_name,
+    };
+    return try std.fs.path.join(allocator, &parts);
+}
+
+fn ensureFailoverQueueDirs(allocator: std.mem.Allocator, codex_home: []const u8) !void {
+    const base = try failoverQueueBaseDirPath(allocator, codex_home);
+    defer allocator.free(base);
+    try std.fs.cwd().makePath(base);
+
+    inline for (&[_][]const u8{ failover_pending_dir_name, failover_processing_dir_name, failover_done_dir_name }) |subdir| {
+        const dir_path = try failoverQueueDirPath(allocator, codex_home, subdir);
+        defer allocator.free(dir_path);
+        try std.fs.cwd().makePath(dir_path);
+    }
+}
+
+fn renameReplacing(src_path: []const u8, dest_path: []const u8) !void {
+    std.fs.cwd().deleteFile(dest_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    try std.fs.cwd().rename(src_path, dest_path);
+}
+
+fn requeueProcessingFailoverEvents(allocator: std.mem.Allocator, codex_home: []const u8) !void {
+    try ensureFailoverQueueDirs(allocator, codex_home);
+    const processing_dir_path = try failoverQueueDirPath(allocator, codex_home, failover_processing_dir_name);
+    defer allocator.free(processing_dir_path);
+
+    var dir = std.fs.cwd().openDir(processing_dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close();
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        const src_path = try failoverQueueFilePath(allocator, codex_home, failover_processing_dir_name, entry.name);
+        defer allocator.free(src_path);
+        const dest_path = try failoverQueueFilePath(allocator, codex_home, failover_pending_dir_name, entry.name);
+        defer allocator.free(dest_path);
+        try renameReplacing(src_path, dest_path);
+    }
+}
+
+fn claimNextFailoverEvent(allocator: std.mem.Allocator, codex_home: []const u8) !?ClaimedFailoverEvent {
+    try ensureFailoverQueueDirs(allocator, codex_home);
+    try requeueProcessingFailoverEvents(allocator, codex_home);
+
+    const pending_dir_path = try failoverQueueDirPath(allocator, codex_home, failover_pending_dir_name);
+    defer allocator.free(pending_dir_path);
+
+    var dir = std.fs.cwd().openDir(pending_dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer dir.close();
+
+    var chosen_name: ?[]u8 = null;
+    defer if (chosen_name) |name| allocator.free(name);
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        if (chosen_name == null or std.mem.order(u8, entry.name, chosen_name.?) == .lt) {
+            if (chosen_name) |existing| allocator.free(existing);
+            chosen_name = try allocator.dupe(u8, entry.name);
+        }
+    }
+
+    const file_name = chosen_name orelse return null;
+    chosen_name = null;
+
+    const pending_path = try failoverQueueFilePath(allocator, codex_home, failover_pending_dir_name, file_name);
+    defer allocator.free(pending_path);
+    const processing_path = try failoverQueueFilePath(allocator, codex_home, failover_processing_dir_name, file_name);
+    errdefer allocator.free(processing_path);
+    const done_path = try failoverQueueFilePath(allocator, codex_home, failover_done_dir_name, file_name);
+    errdefer allocator.free(done_path);
+
+    try renameReplacing(pending_path, processing_path);
+    return .{
+        .file_name = file_name,
+        .processing_path = processing_path,
+        .done_path = done_path,
+    };
+}
+
+fn archiveClaimedFailoverEvent(event: *ClaimedFailoverEvent) !void {
+    try renameReplacing(event.processing_path, event.done_path);
+}
+
+fn loadClaimedFailoverEvent(allocator: std.mem.Allocator, event: *const ClaimedFailoverEvent) !FailoverEventFile {
+    const data = try std.fs.cwd().readFileAlloc(allocator, event.processing_path, 128 * 1024);
+    defer allocator.free(data);
+
+    var parsed = try std.json.parseFromSlice(FailoverEventFile, allocator, data, .{
+        .ignore_unknown_fields = true,
+    });
+    errdefer parsed.deinit();
+    return parsed.value;
+}
+
+fn failoverEventMatchesCurrentAuth(
+    allocator: std.mem.Allocator,
+    codex_home: []const u8,
+    event: *const FailoverEventFile,
+) !?[]u8 {
+    if (!std.mem.eql(u8, event.source, "codext")) return null;
+    if (!std.mem.eql(u8, event.source_auth_mode, "chatgpt")) return null;
+
+    const auth_path = try registry.activeAuthPath(allocator, codex_home);
+    defer allocator.free(auth_path);
+
+    var info = auth.parseAuthInfo(allocator, auth_path) catch return null;
+    defer info.deinit(allocator);
+    if (info.auth_mode != .chatgpt) return null;
+
+    if (event.source_email) |email| {
+        const current_email = info.email orelse return null;
+        if (!std.ascii.eqlIgnoreCase(current_email, email)) return null;
+    }
+    if (event.source_account_id) |account_id| {
+        const current_account_id = info.chatgpt_account_id orelse return null;
+        if (!std.mem.eql(u8, current_account_id, account_id)) return null;
+    }
+    if (event.source_record_key) |record_key| {
+        const current_record_key = info.record_key orelse return null;
+        if (!std.mem.eql(u8, current_record_key, record_key)) return null;
+    }
+
+    const matched_record_key = info.record_key orelse return null;
+    return try allocator.dupe(u8, matched_record_key);
+}
 fn windowDurationLabel(buf: *[16]u8, window_minutes: ?i64) []const u8 {
     const minutes = window_minutes orelse return "unlabeled";
     if (minutes <= 0) return "unlabeled";
@@ -756,6 +1394,7 @@ pub fn handleAutoCommand(allocator: std.mem.Allocator, codex_home: []const u8, c
             .enable => try enable(allocator, codex_home),
             .disable => try disable(allocator, codex_home),
         },
+        .mode => |mode| try configureMode(allocator, codex_home, mode),
         .configure => |opts| try configureThresholds(allocator, codex_home, opts),
     }
 }
@@ -836,6 +1475,14 @@ pub fn refreshActiveUsage(allocator: std.mem.Allocator, codex_home: []const u8, 
     return refreshActiveUsageWithApiFetcher(allocator, codex_home, reg, usage_api.fetchActiveUsage);
 }
 
+pub fn refreshActiveUsageFromLocalSessions(
+    allocator: std.mem.Allocator,
+    codex_home: []const u8,
+    reg: *registry.Registry,
+) !bool {
+    return refreshActiveUsageFromSessions(allocator, codex_home, reg);
+}
+
 fn fetchActiveAccountNames(
     allocator: std.mem.Allocator,
     access_token: []const u8,
@@ -907,8 +1554,11 @@ pub fn refreshActiveAccountNamesForDaemonWithFetcher(
     }
     if (candidates.items.len == 0) return false;
 
-    var attempted = false;
-    var changed = false;
+    var tasks = std.ArrayList(AccountNameFetchTask).empty;
+    defer {
+        for (tasks.items) |*task| task.deinit(allocator);
+        tasks.deinit(allocator);
+    }
 
     for (candidates.items) |candidate| {
         var latest = try registry.loadRegistry(allocator, codex_home);
@@ -927,20 +1577,32 @@ pub fn refreshActiveAccountNamesForDaemonWithFetcher(
 
         const access_token = info.access_token orelse continue;
         const chatgpt_account_id = info.chatgpt_account_id orelse continue;
-        if (!attempted) {
-            refresh_state.last_account_name_refresh_at_ns = now_ns;
-            attempted = true;
-        }
+        try tasks.append(allocator, try AccountNameFetchTask.init(
+            allocator,
+            candidate.chatgpt_user_id,
+            access_token,
+            chatgpt_account_id,
+        ));
+    }
 
-        const result = fetcher(allocator, access_token, chatgpt_account_id) catch |err| {
-            std.log.warn("account metadata refresh skipped: {s}", .{@errorName(err)});
-            continue;
-        };
-        defer result.deinit(allocator);
+    if (tasks.items.len == 0) return false;
+    refresh_state.last_account_name_refresh_at_ns = now_ns;
 
-        const entries = result.entries orelse continue;
-        if (try applyDaemonAccountNameEntriesToLatestRegistry(allocator, codex_home, candidate.chatgpt_user_id, entries)) {
-            changed = true;
+    var changed = false;
+    var start: usize = 0;
+    while (start < tasks.items.len) : (start += account_name_parallel_fetch_limit) {
+        const end = @min(start + account_name_parallel_fetch_limit, tasks.items.len);
+        try runAccountNameFetchBatch(fetcher, tasks.items[start..end]);
+        for (tasks.items[start..end]) |*task| {
+            if (task.fetch_error) |err| {
+                std.log.warn("account metadata refresh skipped: {s}", .{@errorName(err)});
+                continue;
+            }
+            const result = task.fetch_result orelse continue;
+            const entries = result.entries orelse continue;
+            if (try applyDaemonAccountNameEntriesToLatestRegistry(allocator, codex_home, task.chatgpt_user_id, entries)) {
+                changed = true;
+            }
         }
     }
 
@@ -959,7 +1621,7 @@ pub fn refreshActiveUsageWithApiFetcher(
             .unchanged, .unavailable => false,
         };
     }
-    return refreshActiveUsageFromSessions(allocator, codex_home, reg);
+    return try refreshActiveUsageFromSessions(allocator, codex_home, reg);
 }
 
 const ApiRefreshResult = enum { unavailable, unchanged, updated };
@@ -979,9 +1641,14 @@ fn refreshActiveUsageFromApi(
 
     const account_key = reg.active_account_key orelse return .unchanged;
     const idx = registry.findAccountIndexByAccountKey(reg, account_key) orelse return .unchanged;
-    if (registry.rateLimitSnapshotsEqual(reg.accounts.items[idx].last_usage, latest)) return .unchanged;
+    if (registry.rateLimitSnapshotsEqualIgnoringCreditBalance(reg.accounts.items[idx].last_usage, latest)) {
+        try registry.markAccountAuthVerified(allocator, reg, account_key);
+        return .unchanged;
+    }
 
+    try registry.preserveCreditBalanceIfMissing(allocator, reg.accounts.items[idx].last_usage, &latest);
     registry.updateUsage(allocator, reg, account_key, latest);
+    try registry.markAccountAuthVerified(allocator, reg, account_key);
     snapshot_consumed = true;
     return .updated;
 }
@@ -991,7 +1658,7 @@ fn refreshActiveUsageFromSessions(
     codex_home: []const u8,
     reg: *registry.Registry,
 ) !bool {
-    const latest_usage = sessions.scanLatestUsageWithSource(allocator, codex_home) catch |err| switch (err) {
+    const latest_usage = sessions.scanLatestUsageWithRuntimeCache(allocator, codex_home) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
@@ -1012,10 +1679,15 @@ fn refreshActiveUsageFromSessions(
     const activated_at_ms = reg.active_account_activated_at_ms orelse 0;
     if (latest.event_timestamp_ms < activated_at_ms) return false;
     const idx = registry.findAccountIndexByAccountKey(reg, account_key) orelse return false;
-    if (registry.rolloutSignaturesEqual(reg.accounts.items[idx].last_local_rollout, signature)) return false;
+    if (registry.rolloutSignaturesEqual(reg.accounts.items[idx].last_local_rollout, signature)) {
+        try registry.markAccountAuthVerified(allocator, reg, account_key);
+        return false;
+    }
+    try registry.preserveCreditBalanceIfMissing(allocator, reg.accounts.items[idx].last_usage, &latest.snapshot);
     registry.updateUsage(allocator, reg, account_key, latest.snapshot);
     snapshot_consumed = true;
     try registry.setAccountLastLocalRollout(allocator, &reg.accounts.items[idx], latest.path, latest.event_timestamp_ms);
+    try registry.markAccountAuthVerified(allocator, reg, account_key);
     return true;
 }
 
@@ -1088,7 +1760,7 @@ fn refreshActiveUsageForDaemonWithDetailedApiFetcher(
         });
         return false;
     }
-    if (registry.rateLimitSnapshotsEqual(reg.accounts.items[active_idx.?].last_usage, latest)) {
+    if (registry.rateLimitSnapshotsEqualIgnoringCreditBalance(reg.accounts.items[active_idx.?].last_usage, latest)) {
         emitTaggedDaemonLog(.debug, "api", "refresh usage{s}status={s}", .{
             fieldSeparator(),
             apiStatusLabel(&status_buf, status_code, true, missing_auth),
@@ -1097,6 +1769,7 @@ fn refreshActiveUsageForDaemonWithDetailedApiFetcher(
         return false;
     }
 
+    try registry.preserveCreditBalanceIfMissing(allocator, reg.accounts.items[active_idx.?].last_usage, &latest);
     registry.updateUsage(allocator, reg, account_key, latest);
     snapshot_consumed = true;
     emitTaggedDaemonLog(.info, "api", "refresh usage{s}status={s}", .{
@@ -1178,13 +1851,26 @@ fn refreshActiveUsageFromSessionsForDaemon(
     const file_label = rolloutFileLabel(&file_buf, latest_event.path);
 
     if (!latest_event.hasUsableWindows()) {
-        if (try applyLatestUsableSnapshotFromRolloutFile(
+        if (try sessions.cloneLatestUsableFromCache(allocator, &refresh_state.rollout_scan_cache)) |cloned_usable| {
+            var usable = cloned_usable;
+            defer usable.deinit(allocator);
+            if (usable.event_timestamp_ms >= activated_at_ms) {
+                const usable_signature: registry.RolloutSignature = .{
+                    .path = usable.path,
+                    .event_timestamp_ms = usable.event_timestamp_ms,
+                };
+                if (registry.rolloutSignaturesEqual(reg.accounts.items[idx].last_local_rollout, usable_signature)) {
+                    refresh_state.clearPending(allocator);
+                    return false;
+                }
+            }
+        }
+        if (try applyLatestUsableSnapshotFromRolloutCache(
             allocator,
             reg,
             account_key,
             idx,
-            latest_event.path,
-            latest_event.mtime,
+            &refresh_state.rollout_scan_cache,
             activated_at_ms,
         )) {
             refresh_state.clearPending(allocator);
@@ -1193,13 +1879,22 @@ fn refreshActiveUsageFromSessionsForDaemon(
         if (refresh_state.pendingMatches(account_key, signature)) {
             return false;
         }
-        emitTaggedDaemonLog(.warning, "local", "no usage limits window{s}fallback-to-api{s}event={s}{s}file={s}", .{
-            fieldSeparator(),
-            fieldSeparator(),
-            event_time,
-            fieldSeparator(),
-            file_label,
-        });
+        if (reg.api.usage) {
+            emitTaggedDaemonLog(.warning, "local", "no usable local snapshot{s}fallback-to-api{s}event={s}{s}file={s}", .{
+                fieldSeparator(),
+                fieldSeparator(),
+                event_time,
+                fieldSeparator(),
+                file_label,
+            });
+        } else {
+            emitTaggedDaemonLog(.warning, "local", "no usable local snapshot{s}event={s}{s}file={s}", .{
+                fieldSeparator(),
+                event_time,
+                fieldSeparator(),
+                file_label,
+            });
+        }
         try refresh_state.setPending(allocator, account_key, signature);
         return false;
     }
@@ -1213,10 +1908,49 @@ fn refreshActiveUsageFromSessionsForDaemon(
         fieldSeparator(),
         file_label,
     });
-    registry.updateUsage(allocator, reg, account_key, latest_event.snapshot.?);
+    var latest_snapshot = latest_event.snapshot.?;
+    try registry.preserveCreditBalanceIfMissing(allocator, reg.accounts.items[idx].last_usage, &latest_snapshot);
+    registry.updateUsage(allocator, reg, account_key, latest_snapshot);
     latest_event.snapshot = null;
     try registry.setAccountLastLocalRollout(allocator, &reg.accounts.items[idx], latest_event.path, latest_event.event_timestamp_ms);
     refresh_state.clearPending(allocator);
+    return true;
+}
+
+fn applyLatestUsableSnapshotFromRolloutCache(
+    allocator: std.mem.Allocator,
+    reg: *registry.Registry,
+    account_key: []const u8,
+    idx: usize,
+    cache: *const sessions.RolloutScanCache,
+    activated_at_ms: i64,
+) !bool {
+    const latest_usage = try sessions.cloneLatestUsableFromCache(allocator, cache);
+    if (latest_usage == null) return false;
+
+    var usable = latest_usage.?;
+    var snapshot_consumed = false;
+    defer {
+        allocator.free(usable.path);
+        if (!snapshot_consumed) {
+            registry.freeRateLimitSnapshot(allocator, &usable.snapshot);
+        }
+    }
+
+    if (usable.event_timestamp_ms < activated_at_ms) return false;
+
+    const usable_signature: registry.RolloutSignature = .{
+        .path = usable.path,
+        .event_timestamp_ms = usable.event_timestamp_ms,
+    };
+    if (registry.rolloutSignaturesEqual(reg.accounts.items[idx].last_local_rollout, usable_signature)) {
+        return false;
+    }
+
+    try registry.preserveCreditBalanceIfMissing(allocator, reg.accounts.items[idx].last_usage, &usable.snapshot);
+    registry.updateUsage(allocator, reg, account_key, usable.snapshot);
+    snapshot_consumed = true;
+    try registry.setAccountLastLocalRollout(allocator, &reg.accounts.items[idx], usable.path, usable.event_timestamp_ms);
     return true;
 }
 
@@ -1254,6 +1988,7 @@ fn applyLatestUsableSnapshotFromRolloutFile(
         return false;
     }
 
+    try registry.preserveCreditBalanceIfMissing(allocator, reg.accounts.items[idx].last_usage, &usable.snapshot);
     registry.updateUsage(allocator, reg, account_key, usable.snapshot);
     snapshot_consumed = true;
     try registry.setAccountLastLocalRollout(allocator, &reg.accounts.items[idx], usable.path, usable.event_timestamp_ms);
@@ -1262,33 +1997,24 @@ fn applyLatestUsableSnapshotFromRolloutFile(
 
 pub fn bestAutoSwitchCandidateIndex(reg: *registry.Registry, now: i64) ?usize {
     const active = reg.active_account_key orelse return null;
-    var best_idx: ?usize = null;
-    var best: ?CandidateScore = null;
-    for (reg.accounts.items, 0..) |*rec, idx| {
-        if (std.mem.eql(u8, rec.account_key, active)) continue;
-        const score = candidateScore(rec, now);
-        if (best == null or candidateBetter(score, best.?)) {
-            best = score;
-            best_idx = idx;
-        }
-    }
-    return best_idx;
+    return bestEligibleAccountIndexAt(reg, now, active, &.{});
 }
 
 pub fn shouldSwitchCurrent(reg: *registry.Registry, now: i64) bool {
     const account_key = reg.active_account_key orelse return false;
     const idx = registry.findAccountIndexByAccountKey(reg, account_key) orelse return false;
     const rec = &reg.accounts.items[idx];
+    if (registry.accountSnapshotFreshness(rec, now) != .fresh) return false;
     const resolved_5h = resolve5hTriggerWindow(rec.last_usage);
-    const threshold_5h_percent = effective5hThresholdPercent(reg, rec, resolved_5h.allow_free_guard);
+    const threshold_5h_percent = effective5hThresholdPercent(reg.auto_switch, rec, resolved_5h.allow_free_guard);
     const rem_5h = registry.remainingPercentAt(resolved_5h.window, now);
     const rem_week = registry.remainingPercentAt(registry.resolveRateWindow(rec.last_usage, 10080, false), now);
     return (rem_5h != null and rem_5h.? < threshold_5h_percent) or
         (rem_week != null and rem_week.? < @as(i64, reg.auto_switch.threshold_weekly_percent));
 }
 
-fn effective5hThresholdPercent(reg: *registry.Registry, rec: *const registry.AccountRecord, allow_free_guard: bool) i64 {
-    var threshold = @as(i64, reg.auto_switch.threshold_5h_percent);
+fn effective5hThresholdPercent(cfg: registry.AutoSwitchConfig, rec: *const registry.AccountRecord, allow_free_guard: bool) i64 {
+    var threshold = @as(i64, cfg.threshold_5h_percent);
     if (allow_free_guard and registry.resolvePlan(rec) == .free) {
         threshold = @max(threshold, free_plan_realtime_guard_5h_percent);
     }
@@ -1298,6 +2024,37 @@ fn effective5hThresholdPercent(reg: *registry.Registry, rec: *const registry.Acc
 pub fn maybeAutoSwitch(allocator: std.mem.Allocator, codex_home: []const u8, reg: *registry.Registry) !bool {
     const attempt = try maybeAutoSwitchWithUsageFetcher(allocator, codex_home, reg, usage_api.fetchUsageForAuthPath);
     return attempt.switched;
+}
+
+pub fn refreshBestSwitchCandidatesForForeground(allocator: std.mem.Allocator, codex_home: []const u8, reg: *registry.Registry) !bool {
+    return refreshBestSwitchCandidatesForForegroundWithUsageFetcher(
+        allocator,
+        codex_home,
+        reg,
+        usage_api.fetchUsageForAuthPathDetailed,
+    );
+}
+
+pub fn refreshBestSwitchCandidatesForForegroundWithUsageFetcher(
+    allocator: std.mem.Allocator,
+    codex_home: []const u8,
+    reg: *registry.Registry,
+    usage_fetcher: anytype,
+) !bool {
+    if (!reg.api.usage) return false;
+    const now = std.time.timestamp();
+    var skipped_candidates = std.ArrayListUnmanaged([]const u8).empty;
+    defer skipped_candidates.deinit(allocator);
+    const summary = try refreshBestKnownSwitchCandidatesWithUsageFetcher(
+        allocator,
+        codex_home,
+        reg,
+        usage_fetcher,
+        now,
+        std.time.nanoTimestamp(),
+        &skipped_candidates,
+    );
+    return summary.updated != 0;
 }
 
 pub fn maybeAutoSwitchWithUsageFetcher(
@@ -1317,7 +2074,12 @@ pub fn maybeAutoSwitchForDaemonWithUsageFetcher(
     usage_fetcher: anytype,
 ) !AutoSwitchAttempt {
     if (!reg.auto_switch.enabled) return .{ .refreshed_candidates = false, .switched = false };
+    if (reg.auto_switch.mode == .pinned or reg.auto_switch.mode == .failover) {
+        return .{ .refreshed_candidates = false, .switched = false };
+    }
     const now = std.time.timestamp();
+    const should_switch_current = shouldSwitchCurrent(reg, now);
+    const proactive_mode = reg.auto_switch.mode == .proactive;
     if (refresh_state.current_reg == null and refresh_state.candidate_index.heap.items.len == 0) {
         try refresh_state.candidate_index.rebuild(allocator, reg, now);
     } else {
@@ -1329,8 +2091,7 @@ pub fn maybeAutoSwitchForDaemonWithUsageFetcher(
         .refreshed_candidates = false,
         .switched = false,
     };
-    const current = candidateScore(&reg.accounts.items[active_idx], now);
-    const should_switch_current = shouldSwitchCurrent(reg, now);
+    const current = currentScore(&reg.accounts.items[active_idx], now);
 
     var changed = false;
     var refreshed_candidates = false;
@@ -1349,7 +2110,7 @@ pub fn maybeAutoSwitchForDaemonWithUsageFetcher(
         changed = upkeep.updated != 0;
     }
 
-    if (!should_switch_current) {
+    if (!should_switch_current and !proactive_mode) {
         return .{
             .refreshed_candidates = refreshed_candidates,
             .state_changed = changed,
@@ -1383,8 +2144,7 @@ pub fn maybeAutoSwitchForDaemonWithUsageFetcher(
             .state_changed = changed,
             .switched = false,
         };
-        const candidate = candidateScore(&reg.accounts.items[candidate_idx], now);
-        if (candidate.value <= current.value) {
+        if (current != null and !candidateBeatsCurrent(reg, active_idx, candidate_idx, now)) {
             return .{
                 .refreshed_candidates = refreshed_candidates,
                 .state_changed = changed,
@@ -1421,8 +2181,7 @@ pub fn maybeAutoSwitchForDaemonWithUsageFetcher(
         .state_changed = changed,
         .switched = false,
     };
-    const candidate = candidateScore(&reg.accounts.items[candidate_idx], now);
-    if (candidate.value <= current.value) {
+    if (current != null and !candidateBeatsCurrent(reg, active_idx, candidate_idx, now)) {
         return .{
             .refreshed_candidates = refreshed_candidates,
             .state_changed = changed,
@@ -1457,9 +2216,14 @@ fn maybeAutoSwitchWithUsageFetcherAndRefreshState(
     usage_fetcher: anytype,
 ) !AutoSwitchAttempt {
     if (!reg.auto_switch.enabled) return .{ .refreshed_candidates = false, .switched = false };
+    if (reg.auto_switch.mode == .pinned or reg.auto_switch.mode == .failover) {
+        return .{ .refreshed_candidates = false, .switched = false };
+    }
     const active = reg.active_account_key orelse return .{ .refreshed_candidates = false, .switched = false };
     const now = std.time.timestamp();
-    if (!shouldSwitchCurrent(reg, now)) return .{ .refreshed_candidates = false, .switched = false };
+    const should_switch_current = shouldSwitchCurrent(reg, now);
+    const proactive_mode = reg.auto_switch.mode == .proactive;
+    if (!should_switch_current and !proactive_mode) return .{ .refreshed_candidates = false, .switched = false };
 
     _ = refresh_state;
     const should_refresh_candidates = reg.api.usage;
@@ -1473,13 +2237,12 @@ fn maybeAutoSwitchWithUsageFetcherAndRefreshState(
         .refreshed_candidates = refreshed_candidates,
         .switched = false,
     };
-    const current = candidateScore(&reg.accounts.items[active_idx], now);
     const candidate_idx = bestAutoSwitchCandidateIndex(reg, now) orelse return .{
         .refreshed_candidates = refreshed_candidates,
         .switched = false,
     };
-    const candidate = candidateScore(&reg.accounts.items[candidate_idx], now);
-    if (candidate.value <= current.value) {
+    const current = currentScore(&reg.accounts.items[active_idx], now);
+    if (current != null and !candidateBeatsCurrent(reg, active_idx, candidate_idx, now)) {
         return .{
             .refreshed_candidates = refreshed_candidates,
             .switched = false,
@@ -1503,6 +2266,7 @@ fn refreshAutoSwitchCandidatesWithUsageFetcher(
 
     for (reg.accounts.items) |rec| {
         if (std.mem.eql(u8, rec.account_key, active)) continue;
+        if (accountIsBlocked(reg, rec.account_key, std.time.timestamp())) continue;
         if (rec.auth_mode != null and rec.auth_mode.? != .chatgpt) continue;
         attempted += 1;
 
@@ -1516,7 +2280,8 @@ fn refreshAutoSwitchCandidatesWithUsageFetcher(
         var snapshot_consumed = false;
         defer if (!snapshot_consumed) registry.freeRateLimitSnapshot(allocator, &latest);
 
-        if (registry.rateLimitSnapshotsEqual(rec.last_usage, latest)) continue;
+        if (registry.rateLimitSnapshotsEqualIgnoringCreditBalance(rec.last_usage, latest)) continue;
+        try registry.preserveCreditBalanceIfMissing(allocator, rec.last_usage, &latest);
         registry.updateUsage(allocator, reg, rec.account_key, latest);
         snapshot_consumed = true;
         changed = true;
@@ -1539,6 +2304,28 @@ fn keyIsSkipped(skipped_keys: []const []const u8, account_key: []const u8) bool 
 }
 
 fn bestDaemonCandidateForSwitch(
+    _: std.mem.Allocator,
+    refresh_state: *DaemonRefreshState,
+    skipped_keys: []const []const u8,
+    now_ns: i128,
+) !?[]const u8 {
+    var best: ?CandidateScore = null;
+    var best_account_key: ?[]const u8 = null;
+    for (refresh_state.candidate_index.heap.items) |entry| {
+        const account_key = entry.account_key;
+        if (refresh_state.candidateIsRejected(account_key, now_ns)) continue;
+        if (keyIsSkipped(skipped_keys, account_key)) continue;
+        if (refresh_state.candidateIsStale(account_key, now_ns)) continue;
+        if (entry.score.refresh_only) continue;
+        if (best == null or candidateBetter(entry.score, best.?)) {
+            best = entry.score;
+            best_account_key = account_key;
+        }
+    }
+    return best_account_key;
+}
+
+fn nextDaemonCandidateToValidate(
     allocator: std.mem.Allocator,
     refresh_state: *DaemonRefreshState,
     skipped_keys: []const []const u8,
@@ -1549,7 +2336,9 @@ fn bestDaemonCandidateForSwitch(
 
     for (ordered.items) |account_key| {
         if (refresh_state.candidateIsRejected(account_key, now_ns)) continue;
-        if (!keyIsSkipped(skipped_keys, account_key)) return account_key;
+        if (keyIsSkipped(skipped_keys, account_key)) continue;
+        if (!refresh_state.candidateIsStale(account_key, now_ns)) continue;
+        return account_key;
     }
     return null;
 }
@@ -1563,26 +2352,19 @@ fn refreshDaemonCandidateUpkeepWithUsageFetcher(
     now: i64,
     now_ns: i128,
 ) !CandidateRefreshSummary {
-    var ordered = try refresh_state.candidate_index.orderedKeys(allocator);
-    defer ordered.deinit(allocator);
-
-    var summary: CandidateRefreshSummary = .{};
-    for (ordered.items) |account_key| {
-        if (!refresh_state.candidateIsStale(account_key, now_ns)) break;
-        const result = try refreshDaemonCandidateUsageByKeyWithFetcher(
-            allocator,
-            codex_home,
-            reg,
-            refresh_state,
-            account_key,
-            usage_fetcher,
-            now_ns,
-        );
-        summary.attempted += result.attempted;
-        summary.updated += result.updated;
-        if (result.visited) break;
-    }
-
+    var keys: [1][]const u8 = undefined;
+    const selected = try collectNextDaemonCandidatesToValidate(allocator, refresh_state, &.{}, now_ns, keys[0..]);
+    if (selected == 0) return .{};
+    const summary = try refreshDaemonCandidateUsageBatchWithFetcher(
+        allocator,
+        codex_home,
+        reg,
+        refresh_state,
+        keys[0..selected],
+        usage_fetcher,
+        now_ns,
+        null,
+    );
     _ = now;
     return summary;
 }
@@ -1600,28 +2382,187 @@ fn refreshDaemonSwitchCandidatesWithUsageFetcher(
     var summary: CandidateRefreshSummary = .{};
     var visited: usize = 0;
     while (visited < candidate_switch_validation_limit) : (visited += 1) {
-        const best_account_key = (try bestDaemonCandidateForSwitch(allocator, refresh_state, skipped_keys.items, now_ns)) orelse break;
-        if (!refresh_state.candidateIsStale(best_account_key, now_ns)) break;
+        var keys: [candidate_parallel_fetch_limit][]const u8 = undefined;
+        const limit = @min(candidate_parallel_fetch_limit, candidate_switch_validation_limit - visited);
+        const selected = try collectNextDaemonCandidatesToValidate(
+            allocator,
+            refresh_state,
+            skipped_keys.items,
+            now_ns,
+            keys[0..limit],
+        );
+        if (selected == 0) break;
 
-        const result = try refreshDaemonCandidateUsageByKeyWithFetcher(
+        const batch = try refreshDaemonCandidateUsageBatchWithFetcher(
             allocator,
             codex_home,
             reg,
             refresh_state,
-            best_account_key,
+            keys[0..selected],
             usage_fetcher,
             now_ns,
+            skipped_keys,
         );
-        summary.attempted += result.attempted;
-        summary.updated += result.updated;
-        if (result.disqualify_for_switch) {
-            try skipped_keys.append(allocator, best_account_key);
-        }
-        if (!result.visited) break;
+        summary.attempted += batch.attempted;
+        summary.updated += batch.updated;
+        visited += selected - 1;
     }
 
     _ = now;
     return summary;
+}
+
+fn refreshBestKnownSwitchCandidatesWithUsageFetcher(
+    allocator: std.mem.Allocator,
+    codex_home: []const u8,
+    reg: *registry.Registry,
+    usage_fetcher: anytype,
+    now: i64,
+    now_ns: i128,
+    skipped_keys: *std.ArrayListUnmanaged([]const u8),
+) !CandidateRefreshSummary {
+    _ = now_ns;
+    var summary: CandidateRefreshSummary = .{};
+    var visited: usize = 0;
+    while (visited < candidate_switch_validation_limit) : (visited += 1) {
+        var keys: [candidate_parallel_fetch_limit][]const u8 = undefined;
+        const limit = @min(candidate_parallel_fetch_limit, candidate_switch_validation_limit - visited);
+        const selected = try collectBestKnownCandidatesToValidate(
+            allocator,
+            reg,
+            skipped_keys.items,
+            now,
+            keys[0..limit],
+        );
+        if (selected == 0) break;
+
+        const batch = try refreshForegroundBestKnownCandidateUsageBatchWithFetcher(
+            allocator,
+            codex_home,
+            reg,
+            keys[0..selected],
+            usage_fetcher,
+            skipped_keys,
+        );
+        summary.attempted += batch.attempted;
+        summary.updated += batch.updated;
+        visited += selected - 1;
+    }
+    return summary;
+}
+
+fn refreshForegroundBestKnownCandidateUsageBatchWithFetcher(
+    allocator: std.mem.Allocator,
+    codex_home: []const u8,
+    reg: *registry.Registry,
+    account_keys: []const []const u8,
+    usage_fetcher: anytype,
+    skipped_keys: *std.ArrayListUnmanaged([]const u8),
+) !CandidateRefreshSummary {
+    var summary: CandidateRefreshSummary = .{};
+    var tasks: [candidate_parallel_fetch_limit]CandidateUsageFetchTask = undefined;
+    var prepared_count: usize = 0;
+    defer {
+        for (tasks[0..prepared_count]) |*task| task.deinit(allocator);
+    }
+
+    for (account_keys) |account_key| {
+        const idx = registry.findAccountIndexByAccountKey(reg, account_key) orelse continue;
+        const rec = &reg.accounts.items[idx];
+        if (rec.auth_mode != null and rec.auth_mode.? != .chatgpt) continue;
+        registry.validateAccountSnapshotForAccount(allocator, codex_home, reg, account_key) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try skipped_keys.append(allocator, account_key);
+                continue;
+            },
+        };
+
+        const auth_path = registry.accountAuthPath(allocator, codex_home, account_key) catch continue;
+        errdefer allocator.free(auth_path);
+        tasks[prepared_count] = .{
+            .account_key = account_key,
+            .auth_path = auth_path,
+        };
+        prepared_count += 1;
+    }
+
+    if (prepared_count == 0) return summary;
+    try runCandidateUsageFetchBatch(usage_fetcher, tasks[0..prepared_count]);
+
+    for (tasks[0..prepared_count]) |*task| {
+        const result = try applyForegroundBestKnownFetchTaskResult(
+            allocator,
+            reg,
+            task.account_key,
+            task.fetch_result orelse .{ .snapshot = null, .status_code = null },
+            task.fetch_error,
+        );
+        summary.attempted += result.attempted;
+        summary.updated += result.updated;
+        if (result.disqualify_for_switch) {
+            try skipped_keys.append(allocator, task.account_key);
+        }
+    }
+
+    return summary;
+}
+
+fn applyForegroundBestKnownFetchTaskResult(
+    allocator: std.mem.Allocator,
+    reg: *registry.Registry,
+    account_key: []const u8,
+    fetch_result: usage_api.UsageFetchResult,
+    fetch_error: ?anyerror,
+) !SingleCandidateRefreshResult {
+    const idx = registry.findAccountIndexByAccountKey(reg, account_key) orelse return .{};
+    const rec = &reg.accounts.items[idx];
+    const needs_verified_record = rec.auth_health != .verified or rec.auth_error != null;
+
+    if (fetch_error != null) {
+        try registry.markAccountAuthFailure(allocator, reg, account_key, .api_failed, @errorName(fetch_error.?));
+        return .{ .visited = true, .attempted = 1, .updated = 1, .disqualify_for_switch = true };
+    }
+    if (fetch_result.missing_auth) {
+        try registry.markAccountAuthFailure(allocator, reg, account_key, .missing_auth, "usage API could not load account auth");
+        return .{ .visited = true, .attempted = 1, .updated = 1, .disqualify_for_switch = true };
+    }
+    if (fetch_result.status_code) |status_code| {
+        if (status_code != 200) {
+            var buf: [32]u8 = undefined;
+            const reason = std.fmt.bufPrint(&buf, "usage API HTTP {d}", .{status_code}) catch "usage API HTTP error";
+            try registry.markAccountAuthFailure(allocator, reg, account_key, .api_failed, reason);
+            return .{ .visited = true, .attempted = 1, .updated = 1, .disqualify_for_switch = true };
+        }
+    }
+
+    const latest_usage = fetch_result.snapshot;
+    if (latest_usage == null) {
+        if (fetch_result.status_code != null) {
+            try registry.markAccountAuthFailure(allocator, reg, account_key, .api_failed, "usage API returned no usable quota windows");
+        }
+        return .{
+            .visited = true,
+            .attempted = 1,
+            .updated = if (fetch_result.status_code != null) 1 else 0,
+            .disqualify_for_switch = fetch_result.status_code != null,
+        };
+    }
+
+    if (registry.rateLimitSnapshotsEqualIgnoringCreditBalance(rec.last_usage, latest_usage.?)) {
+        if (needs_verified_record) {
+            try registry.markAccountAuthVerified(allocator, reg, account_key);
+            return .{ .visited = true, .attempted = 1, .updated = 1 };
+        }
+        return .{ .visited = true, .attempted = 1 };
+    }
+
+    var cloned = try registry.cloneRateLimitSnapshot(allocator, latest_usage.?);
+    errdefer registry.freeRateLimitSnapshot(allocator, &cloned);
+    try registry.preserveCreditBalanceIfMissing(allocator, rec.last_usage, &cloned);
+    registry.updateUsage(allocator, reg, account_key, cloned);
+    try registry.markAccountAuthVerified(allocator, reg, account_key);
+    return .{ .visited = true, .attempted = 1, .updated = 1 };
 }
 
 const SingleCandidateRefreshResult = struct {
@@ -1699,12 +2640,294 @@ fn refreshDaemonCandidateUsageByKeyWithFetcher(
 
     refresh_state.clearCandidateRejected(account_key);
 
-    if (registry.rateLimitSnapshotsEqual(rec.last_usage, latest)) {
+    if (registry.rateLimitSnapshotsEqualIgnoringCreditBalance(rec.last_usage, latest)) {
         return .{ .visited = true, .attempted = 1 };
     }
 
+    try registry.preserveCreditBalanceIfMissing(allocator, rec.last_usage, &latest);
     registry.updateUsage(allocator, reg, account_key, latest);
     snapshot_consumed = true;
+    try refresh_state.candidate_index.upsertFromRegistry(allocator, reg, account_key, std.time.timestamp());
+    return .{ .visited = true, .attempted = 1, .updated = 1 };
+}
+
+const CandidateUsageFetchTask = struct {
+    account_key: []const u8,
+    auth_path: []u8,
+    fetch_result: ?usage_api.UsageFetchResult = null,
+    fetch_error: ?anyerror = null,
+
+    fn deinit(self: *CandidateUsageFetchTask, allocator: std.mem.Allocator) void {
+        allocator.free(self.auth_path);
+        if (self.fetch_result) |*result| {
+            freeUsageFetchResult(worker_fetch_allocator, result);
+        }
+        self.fetch_result = null;
+    }
+
+    fn run(self: *CandidateUsageFetchTask, comptime usage_fetcher: anytype) void {
+        self.fetch_result = usage_fetcher(worker_fetch_allocator, self.auth_path) catch |err| {
+            self.fetch_error = err;
+            return;
+        };
+    }
+};
+
+const AccountNameFetchTask = struct {
+    chatgpt_user_id: []u8,
+    access_token: []u8,
+    chatgpt_account_id: []u8,
+    fetch_result: ?account_api.FetchResult = null,
+    fetch_error: ?anyerror = null,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        chatgpt_user_id: []const u8,
+        access_token: []const u8,
+        chatgpt_account_id: []const u8,
+    ) !AccountNameFetchTask {
+        return .{
+            .chatgpt_user_id = try allocator.dupe(u8, chatgpt_user_id),
+            .access_token = try allocator.dupe(u8, access_token),
+            .chatgpt_account_id = try allocator.dupe(u8, chatgpt_account_id),
+        };
+    }
+
+    fn deinit(self: *AccountNameFetchTask, allocator: std.mem.Allocator) void {
+        allocator.free(self.chatgpt_user_id);
+        allocator.free(self.access_token);
+        allocator.free(self.chatgpt_account_id);
+        if (self.fetch_result) |*result| {
+            result.deinit(worker_fetch_allocator);
+        }
+        self.fetch_result = null;
+    }
+
+    fn run(self: *AccountNameFetchTask, comptime fetcher: anytype) void {
+        self.fetch_result = fetcher(worker_fetch_allocator, self.access_token, self.chatgpt_account_id) catch |err| {
+            self.fetch_error = err;
+            return;
+        };
+    }
+};
+
+fn freeUsageFetchResult(allocator: std.mem.Allocator, result: *usage_api.UsageFetchResult) void {
+    if (result.snapshot) |*snapshot| {
+        registry.freeRateLimitSnapshot(allocator, snapshot);
+    }
+    result.snapshot = null;
+}
+
+fn runThreadBatch(
+    comptime ThreadType: type,
+    threads: []ThreadType,
+    context: anytype,
+    comptime spawn_one: anytype,
+    comptime join_one: anytype,
+) !void {
+    var spawned_count: usize = 0;
+    errdefer {
+        var idx: usize = 0;
+        while (idx < spawned_count) : (idx += 1) {
+            join_one(context, &threads[idx]);
+        }
+    }
+
+    for (threads, 0..) |*thread, idx| {
+        thread.* = try spawn_one(context, idx);
+        spawned_count += 1;
+    }
+
+    for (threads[0..spawned_count]) |*thread| {
+        join_one(context, thread);
+    }
+}
+
+fn runCandidateUsageFetchBatch(comptime usage_fetcher: anytype, tasks: []CandidateUsageFetchTask) !void {
+    var threads: [candidate_parallel_fetch_limit]std.Thread = undefined;
+    const Context = struct {
+        tasks: []CandidateUsageFetchTask,
+    };
+    try runThreadBatch(std.Thread, threads[0..tasks.len], Context{ .tasks = tasks }, struct {
+        fn spawn(ctx: Context, idx: usize) !std.Thread {
+            return std.Thread.spawn(.{}, struct {
+                fn run(job: *CandidateUsageFetchTask) void {
+                    job.run(usage_fetcher);
+                }
+            }.run, .{&ctx.tasks[idx]});
+        }
+    }.spawn, struct {
+        fn join(_: Context, thread: *std.Thread) void {
+            thread.join();
+        }
+    }.join);
+}
+
+fn runAccountNameFetchBatch(comptime fetcher: anytype, tasks: []AccountNameFetchTask) !void {
+    var threads: [account_name_parallel_fetch_limit]std.Thread = undefined;
+    const Context = struct {
+        tasks: []AccountNameFetchTask,
+    };
+    try runThreadBatch(std.Thread, threads[0..tasks.len], Context{ .tasks = tasks }, struct {
+        fn spawn(ctx: Context, idx: usize) !std.Thread {
+            return std.Thread.spawn(.{}, struct {
+                fn run(job: *AccountNameFetchTask) void {
+                    job.run(fetcher);
+                }
+            }.run, .{&ctx.tasks[idx]});
+        }
+    }.spawn, struct {
+        fn join(_: Context, thread: *std.Thread) void {
+            thread.join();
+        }
+    }.join);
+}
+
+fn collectNextDaemonCandidatesToValidate(
+    allocator: std.mem.Allocator,
+    refresh_state: *DaemonRefreshState,
+    skipped_keys: []const []const u8,
+    now_ns: i128,
+    out_keys: [][]const u8,
+) !usize {
+    var ordered = try refresh_state.candidate_index.orderedKeys(allocator);
+    defer ordered.deinit(allocator);
+
+    var count: usize = 0;
+    for (ordered.items) |account_key| {
+        if (refresh_state.candidateIsRejected(account_key, now_ns)) continue;
+        if (keyIsSkipped(skipped_keys, account_key)) continue;
+        if (!refresh_state.candidateIsStale(account_key, now_ns)) continue;
+        out_keys[count] = account_key;
+        count += 1;
+        if (count == out_keys.len) break;
+    }
+    return count;
+}
+
+fn refreshDaemonCandidateUsageBatchWithFetcher(
+    allocator: std.mem.Allocator,
+    codex_home: []const u8,
+    reg: *registry.Registry,
+    refresh_state: *DaemonRefreshState,
+    account_keys: []const []const u8,
+    usage_fetcher: anytype,
+    now_ns: i128,
+    skipped_keys: ?*std.ArrayListUnmanaged([]const u8),
+) !CandidateRefreshSummary {
+    var summary: CandidateRefreshSummary = .{};
+    var tasks: [candidate_parallel_fetch_limit]CandidateUsageFetchTask = undefined;
+    var prepared_count: usize = 0;
+    defer {
+        for (tasks[0..prepared_count]) |*task| task.deinit(allocator);
+    }
+
+    for (account_keys) |account_key| {
+        const idx = registry.findAccountIndexByAccountKey(reg, account_key) orelse continue;
+        const rec = &reg.accounts.items[idx];
+        if (rec.auth_mode != null and rec.auth_mode.? != .chatgpt) {
+            try refresh_state.markCandidateChecked(allocator, account_key, now_ns);
+            refresh_state.clearCandidateRejected(account_key);
+            continue;
+        }
+
+        const auth_path = registry.accountAuthPath(allocator, codex_home, account_key) catch {
+            try refresh_state.markCandidateChecked(allocator, account_key, now_ns);
+            continue;
+        };
+        errdefer allocator.free(auth_path);
+        try refresh_state.markCandidateChecked(allocator, account_key, now_ns);
+        tasks[prepared_count] = .{
+            .account_key = account_key,
+            .auth_path = auth_path,
+        };
+        prepared_count += 1;
+    }
+
+    if (prepared_count == 0) return summary;
+    try runCandidateUsageFetchBatch(usage_fetcher, tasks[0..prepared_count]);
+
+    for (tasks[0..prepared_count]) |*task| {
+        const result = try applyCandidateUsageFetchTaskResult(
+            allocator,
+            reg,
+            refresh_state,
+            task.account_key,
+            task.fetch_result orelse .{ .snapshot = null, .status_code = null },
+            task.fetch_error,
+        );
+        summary.attempted += result.attempted;
+        summary.updated += result.updated;
+        if (result.disqualify_for_switch) {
+            if (skipped_keys) |list| {
+                try list.append(allocator, task.account_key);
+            }
+        }
+    }
+
+    return summary;
+}
+
+fn applyCandidateUsageFetchTaskResult(
+    allocator: std.mem.Allocator,
+    reg: *registry.Registry,
+    refresh_state: *DaemonRefreshState,
+    account_key: []const u8,
+    fetch_result: usage_api.UsageFetchResult,
+    fetch_error: ?anyerror,
+) !SingleCandidateRefreshResult {
+    const idx = registry.findAccountIndexByAccountKey(reg, account_key) orelse return .{};
+    const rec = &reg.accounts.items[idx];
+
+    if (fetch_error != null) {
+        return .{
+            .visited = true,
+            .attempted = 1,
+        };
+    }
+
+    if (fetch_result.missing_auth) {
+        try refresh_state.markCandidateRejected(allocator, account_key);
+        return .{
+            .visited = true,
+            .attempted = 1,
+            .disqualify_for_switch = true,
+        };
+    }
+    if (fetch_result.status_code) |status_code| {
+        if (status_code != 200) {
+            try refresh_state.markCandidateRejected(allocator, account_key);
+            return .{
+                .visited = true,
+                .attempted = 1,
+                .disqualify_for_switch = true,
+            };
+        }
+    }
+
+    const latest_usage = fetch_result.snapshot;
+    if (latest_usage == null) {
+        if (fetch_result.status_code != null) {
+            try refresh_state.markCandidateRejected(allocator, account_key);
+        }
+        return .{
+            .visited = true,
+            .attempted = 1,
+            .disqualify_for_switch = fetch_result.status_code != null,
+        };
+    }
+
+    refresh_state.clearCandidateRejected(account_key);
+
+    if (registry.rateLimitSnapshotsEqualIgnoringCreditBalance(rec.last_usage, latest_usage.?)) {
+        return .{ .visited = true, .attempted = 1 };
+    }
+
+    const cloned = try registry.cloneRateLimitSnapshot(allocator, latest_usage.?);
+    var normalized = cloned;
+    errdefer registry.freeRateLimitSnapshot(allocator, &normalized);
+    try registry.preserveCreditBalanceIfMissing(allocator, rec.last_usage, &normalized);
+    registry.updateUsage(allocator, reg, account_key, normalized);
     try refresh_state.candidate_index.upsertFromRegistry(allocator, reg, account_key, std.time.timestamp());
     return .{ .visited = true, .attempted = 1, .updated = 1 };
 }
@@ -1735,6 +2958,88 @@ fn resolve5hTriggerWindow(usage: ?registry.RateLimitSnapshot) Resolved5hWindow {
     return .{ .window = null, .allow_free_guard = false };
 }
 
+fn processFailoverQueueWithUsageFetcher(
+    allocator: std.mem.Allocator,
+    codex_home: []const u8,
+    reg: *registry.Registry,
+    refresh_state: *DaemonRefreshState,
+    usage_fetcher: anytype,
+) !bool {
+    var changed = try normalizeBlockedAccountState(allocator, reg, std.time.timestamp());
+    if (changed) {
+        try refresh_state.rebuildCandidateState(allocator);
+    }
+    if (reg.auto_switch.mode != .failover) return changed;
+
+    var switch_lock = (try SwitchCoordinatorLock.acquire(allocator, codex_home)) orelse return changed;
+    defer switch_lock.release();
+
+    var claimed = (try claimNextFailoverEvent(allocator, codex_home)) orelse {
+        if (reg.auto_switch.failover_state == .processing) {
+            reg.auto_switch.failover_state = .idle;
+            changed = true;
+        }
+        return changed;
+    };
+    defer claimed.deinit(allocator);
+
+    reg.auto_switch.failover_state = .processing;
+    changed = true;
+
+    var event = loadClaimedFailoverEvent(allocator, &claimed) catch {
+        reg.auto_switch.failover_state = .@"error";
+        try archiveClaimedFailoverEvent(&claimed);
+        return true;
+    };
+    defer event.deinit(allocator);
+
+    const current_source_key = (try failoverEventMatchesCurrentAuth(allocator, codex_home, &event)) orelse {
+        reg.auto_switch.failover_state = .stale_event;
+        try archiveClaimedFailoverEvent(&claimed);
+        return true;
+    };
+    defer allocator.free(current_source_key);
+
+    const source_idx = registry.findAccountIndexByAccountKey(reg, current_source_key) orelse {
+        reg.auto_switch.failover_state = .stale_event;
+        try archiveClaimedFailoverEvent(&claimed);
+        return true;
+    };
+    const source_key = reg.accounts.items[source_idx].account_key;
+    try registry.setBlockedAccount(allocator, reg, source_key, event.resets_at_ms);
+    changed = true;
+    try refresh_state.rebuildCandidateState(allocator);
+
+    if (reg.api.usage and (try refreshBestSwitchCandidatesForForegroundWithUsageFetcher(
+        allocator,
+        codex_home,
+        reg,
+        usage_fetcher,
+    ))) {
+        changed = true;
+    }
+
+    const target_idx = bestFreshKnownAccountIndexExcluding(reg, source_key, &.{}) orelse {
+        reg.auto_switch.failover_state = .no_target;
+        try refresh_state.rebuildCandidateState(allocator);
+        try archiveClaimedFailoverEvent(&claimed);
+        return true;
+    };
+    const target_key = reg.accounts.items[target_idx].account_key;
+    if (std.mem.eql(u8, target_key, source_key)) {
+        reg.auto_switch.failover_state = .no_target;
+        try refresh_state.rebuildCandidateState(allocator);
+        try archiveClaimedFailoverEvent(&claimed);
+        return true;
+    }
+
+    try registry.activateAccountByKey(allocator, codex_home, reg, target_key);
+    reg.auto_switch.failover_state = .switched;
+    try refresh_state.rebuildCandidateState(allocator);
+    try archiveClaimedFailoverEvent(&claimed);
+    return true;
+}
+
 fn daemonCycleWithAccountNameFetcher(
     allocator: std.mem.Allocator,
     codex_home: []const u8,
@@ -1763,6 +3068,15 @@ fn daemonCycleWithAccountNameFetcher(
     if (!reg.auto_switch.enabled) return true;
 
     if (try refreshActiveUsageForDaemon(allocator, codex_home, reg, refresh_state)) {
+        changed = true;
+    }
+    if (try processFailoverQueueWithUsageFetcher(
+        allocator,
+        codex_home,
+        reg,
+        refresh_state,
+        usage_api.fetchUsageForAuthPathDetailed,
+    )) {
         changed = true;
     }
     const active_idx_before = if (reg.active_account_key) |account_key|
@@ -1901,28 +3215,339 @@ fn configureThresholds(allocator: std.mem.Allocator, codex_home: []const u8, opt
     try printStatus(allocator, codex_home);
 }
 
-fn candidateScore(rec: *const registry.AccountRecord, now: i64) CandidateScore {
-    const usage_score = registry.usageScoreAt(rec.last_usage, now) orelse 100;
+fn configureMode(allocator: std.mem.Allocator, codex_home: []const u8, mode: registry.AutoSwitchMode) !void {
+    var reg = try registry.loadRegistry(allocator, codex_home);
+    defer reg.deinit(allocator);
+    reg.auto_switch.mode = mode;
+    reg.auto_switch.failover_state = .idle;
+    if (mode != .pinned) {
+        try registry.setPinnedAccountKey(allocator, &reg, null);
+    }
+    try registry.saveRegistry(allocator, codex_home, &reg);
+    try printStatus(allocator, codex_home);
+}
+
+const ResolvedCandidate5hWindow = struct {
+    window: ?registry.RateLimitWindow,
+    allow_free_guard: bool,
+};
+
+const RankedHeadroom = struct {
+    effective_remaining: i64,
+    weekly_remaining: i64,
+    effective_resets_at: i64,
+};
+
+fn resolve5hCandidateWindow(usage: ?registry.RateLimitSnapshot) ResolvedCandidate5hWindow {
+    if (usage == null) return .{ .window = null, .allow_free_guard = false };
+    if (usage.?.primary) |primary| {
+        if (primary.window_minutes == null) {
+            return .{ .window = primary, .allow_free_guard = true };
+        }
+        if (primary.window_minutes.? == 300) {
+            return .{ .window = primary, .allow_free_guard = true };
+        }
+    }
+    if (usage.?.secondary) |secondary| {
+        if (secondary.window_minutes != null and secondary.window_minutes.? == 300) {
+            return .{ .window = secondary, .allow_free_guard = true };
+        }
+    }
+    return .{ .window = null, .allow_free_guard = false };
+}
+
+fn resetAtOrMax(window: ?registry.RateLimitWindow) i64 {
+    if (window) |resolved| {
+        if (resolved.resets_at) |reset_at| return reset_at;
+    }
+    return std.math.maxInt(i64);
+}
+
+fn rankedHeadroom(rec: *const registry.AccountRecord, now: i64) ?RankedHeadroom {
+    if (registry.accountSnapshotFreshness(rec, now) != .fresh) return null;
+
+    const resolved_5h = resolve5hCandidateWindow(rec.last_usage);
+    const weekly_window = registry.resolveRateWindow(rec.last_usage, 10080, false);
+    const rem_5h = registry.remainingPercentAt(resolved_5h.window, now);
+    const rem_week = registry.remainingPercentAt(weekly_window, now);
+    const effective_remaining = rem_5h orelse rem_week orelse return null;
+    const effective_resets_at = if (rem_5h != null)
+        resetAtOrMax(resolved_5h.window)
+    else
+        resetAtOrMax(weekly_window);
+
     return .{
-        .value = usage_score,
-        .last_usage_at = rec.last_usage_at orelse -1,
-        .created_at = rec.created_at,
+        .effective_remaining = effective_remaining,
+        .weekly_remaining = rem_week orelse effective_remaining,
+        .effective_resets_at = effective_resets_at,
     };
 }
 
-fn candidateBetter(a: CandidateScore, b: CandidateScore) bool {
-    if (a.value != b.value) return a.value > b.value;
-    if (a.last_usage_at != b.last_usage_at) return a.last_usage_at > b.last_usage_at;
-    return a.created_at > b.created_at;
+fn buildCandidateScore(rec: *const registry.AccountRecord, headroom: RankedHeadroom) CandidateScore {
+    return .{
+        .effective_remaining = headroom.effective_remaining,
+        .weekly_remaining = headroom.weekly_remaining,
+        .effective_resets_at = headroom.effective_resets_at,
+        .last_usage_at = rec.last_usage_at orelse -1,
+        .last_used_at = rec.last_used_at orelse -1,
+        .refresh_only = false,
+        .alias = rec.alias,
+        .email = rec.email,
+        .account_key = rec.account_key,
+    };
 }
 
-fn candidateScoreChangeAt(usage: ?registry.RateLimitSnapshot, now: i64) ?i64 {
-    if (usage == null) return null;
+fn refreshPlaceholderScore(rec: *const registry.AccountRecord) CandidateScore {
+    return .{
+        .effective_remaining = -1,
+        .weekly_remaining = -1,
+        .effective_resets_at = std.math.maxInt(i64),
+        .last_usage_at = rec.last_usage_at orelse -1,
+        .last_used_at = rec.last_used_at orelse -1,
+        .refresh_only = true,
+        .alias = rec.alias,
+        .email = rec.email,
+        .account_key = rec.account_key,
+    };
+}
+
+fn rankedHeadroomIgnoringFreshness(rec: *const registry.AccountRecord, now: i64) ?RankedHeadroom {
+    const resolved_5h = resolve5hCandidateWindow(rec.last_usage);
+    const weekly_window = registry.resolveRateWindow(rec.last_usage, 10080, false);
+    const rem_5h = registry.remainingPercentAt(resolved_5h.window, now);
+    const rem_week = registry.remainingPercentAt(weekly_window, now);
+    const effective_remaining = rem_5h orelse rem_week orelse return null;
+    const effective_resets_at = if (rem_5h != null)
+        resetAtOrMax(resolved_5h.window)
+    else
+        resetAtOrMax(weekly_window);
+
+    return .{
+        .effective_remaining = effective_remaining,
+        .weekly_remaining = rem_week orelse effective_remaining,
+        .effective_resets_at = effective_resets_at,
+    };
+}
+
+fn bestKnownRefreshScore(rec: *const registry.AccountRecord, now: i64) ?CandidateScore {
+    if (rec.auth_mode != null and rec.auth_mode.? == .apikey) return null;
+    if (bestKnownQuotaScore(rec, now)) |score| return score;
+
+    if (rankedHeadroomIgnoringFreshness(rec, now)) |headroom| {
+        var score = buildCandidateScore(rec, headroom);
+        score.refresh_only = true;
+        return score;
+    }
+
+    return refreshPlaceholderScore(rec);
+}
+
+fn currentScore(rec: *const registry.AccountRecord, now: i64) ?CandidateScore {
+    return bestKnownQuotaScore(rec, now);
+}
+
+fn candidateBeatsCurrent(
+    reg: *registry.Registry,
+    active_idx: usize,
+    candidate_idx: usize,
+    now: i64,
+) bool {
+    const candidate = candidateScore(&reg.accounts.items[candidate_idx], reg.auto_switch, now) orelse return false;
+    const current = currentScore(&reg.accounts.items[active_idx], now) orelse return true;
+    return candidateBetter(candidate, current);
+}
+
+pub fn bestEligibleAccountIndex(reg: *registry.Registry) ?usize {
+    return bestEligibleAccountIndexExcluding(reg, null, &.{});
+}
+
+pub fn bestFreshKnownAccountIndex(reg: *registry.Registry) ?usize {
+    return bestFreshKnownAccountIndexExcluding(reg, null, &.{});
+}
+
+pub fn bestEligibleAccountIndexExcluding(
+    reg: *registry.Registry,
+    excluded_account_key: ?[]const u8,
+    excluded_indices: []const usize,
+) ?usize {
+    if (reg.accounts.items.len == 0) return null;
+    const now = std.time.timestamp();
+    return bestEligibleAccountIndexAt(reg, now, excluded_account_key, excluded_indices);
+}
+
+pub fn bestFreshKnownAccountIndexExcluding(
+    reg: *registry.Registry,
+    excluded_account_key: ?[]const u8,
+    excluded_indices: []const usize,
+) ?usize {
+    if (reg.accounts.items.len == 0) return null;
+    const now = std.time.timestamp();
+    return bestFreshKnownAccountIndexAt(reg, now, excluded_account_key, excluded_indices);
+}
+
+fn bestEligibleAccountIndexAt(
+    reg: *registry.Registry,
+    now: i64,
+    excluded_account_key: ?[]const u8,
+    excluded_indices: []const usize,
+) ?usize {
+    var best_idx: ?usize = null;
+    var best: ?CandidateScore = null;
+    for (reg.accounts.items, 0..) |*rec, idx| {
+        if (excluded_account_key) |account_key| {
+            if (std.mem.eql(u8, rec.account_key, account_key)) continue;
+        }
+        if (selectionContainsIndex(excluded_indices, idx)) continue;
+        if (accountIsBlocked(reg, rec.account_key, now)) continue;
+        const score = candidateScore(rec, reg.auto_switch, now) orelse continue;
+        if (best == null or candidateBetter(score, best.?)) {
+            best = score;
+            best_idx = idx;
+        }
+    }
+    return best_idx;
+}
+
+fn bestFreshKnownAccountIndexAt(
+    reg: *registry.Registry,
+    now: i64,
+    excluded_account_key: ?[]const u8,
+    excluded_indices: []const usize,
+) ?usize {
+    var best_idx: ?usize = null;
+    var best: ?CandidateScore = null;
+    for (reg.accounts.items, 0..) |*rec, idx| {
+        if (excluded_account_key) |account_key| {
+            if (std.mem.eql(u8, rec.account_key, account_key)) continue;
+        }
+        if (selectionContainsIndex(excluded_indices, idx)) continue;
+        if (accountIsBlocked(reg, rec.account_key, now)) continue;
+        const score = bestKnownQuotaScore(rec, now) orelse continue;
+        if (best == null or candidateBetter(score, best.?)) {
+            best = score;
+            best_idx = idx;
+        }
+    }
+    return best_idx;
+}
+
+fn selectionContainsIndex(indices: []const usize, target: usize) bool {
+    for (indices) |idx| {
+        if (idx == target) return true;
+    }
+    return false;
+}
+
+fn bestKnownQuotaScore(rec: *const registry.AccountRecord, now: i64) ?CandidateScore {
+    if (!registry.accountAuthSelectable(rec)) return null;
+    if (rec.auth_mode != null and rec.auth_mode.? == .apikey) return null;
+    const headroom = rankedHeadroom(rec, now) orelse return null;
+    return buildCandidateScore(rec, headroom);
+}
+
+fn collectBestKnownCandidatesToValidate(
+    allocator: std.mem.Allocator,
+    reg: *registry.Registry,
+    skipped_keys: []const []const u8,
+    now: i64,
+    out_keys: [][]const u8,
+) !usize {
+    var candidates = std.ArrayList(CandidateEntry).empty;
+    defer candidates.deinit(allocator);
+
+    const active = reg.active_account_key;
+    for (reg.accounts.items) |*rec| {
+        if (active) |active_key| {
+            if (std.mem.eql(u8, rec.account_key, active_key)) continue;
+        }
+        if (accountIsBlocked(reg, rec.account_key, now)) continue;
+        if (registry.accountSnapshotFreshness(rec, now) == .fresh) continue;
+        const score = bestKnownRefreshScore(rec, now) orelse continue;
+        try candidates.append(allocator, .{
+            .account_key = rec.account_key,
+            .score = score,
+        });
+    }
+
+    std.mem.sort(CandidateEntry, candidates.items, {}, struct {
+        fn lessThan(_: void, a: CandidateEntry, b: CandidateEntry) bool {
+            return candidateRefreshBetter(a.score, b.score);
+        }
+    }.lessThan);
+
+    var count: usize = 0;
+    for (candidates.items) |candidate| {
+        if (keyIsSkipped(skipped_keys, candidate.account_key)) continue;
+        out_keys[count] = candidate.account_key;
+        count += 1;
+        if (count == out_keys.len) break;
+    }
+    return count;
+}
+
+fn candidateScore(rec: *const registry.AccountRecord, cfg: registry.AutoSwitchConfig, now: i64) ?CandidateScore {
+    const base = bestKnownQuotaScore(rec, now) orelse return null;
+
+    const resolved_5h = resolve5hCandidateWindow(rec.last_usage);
+    const threshold_5h_percent = effective5hThresholdPercent(cfg, rec, resolved_5h.allow_free_guard);
+    const rem_5h = registry.remainingPercentAt(resolved_5h.window, now);
+    const rem_week = registry.remainingPercentAt(registry.resolveRateWindow(rec.last_usage, 10080, false), now);
+
+    if (rem_5h != null and rem_5h.? < threshold_5h_percent) return null;
+    if (rem_week != null and rem_week.? < @as(i64, cfg.threshold_weekly_percent)) return null;
+
+    return base;
+}
+
+fn daemonCandidateScore(
+    rec: *const registry.AccountRecord,
+    reg: *const registry.Registry,
+    now: i64,
+) ?CandidateScore {
+    if (candidateScore(rec, reg.auto_switch, now)) |score| return score;
+    if (!reg.api.usage) return null;
+    if (rec.auth_mode != null and rec.auth_mode.? != .chatgpt) return null;
+    return refreshPlaceholderScore(rec);
+}
+
+fn candidateBetter(a: CandidateScore, b: CandidateScore) bool {
+    if (a.refresh_only != b.refresh_only) return !a.refresh_only;
+    if (a.effective_remaining != b.effective_remaining) return a.effective_remaining > b.effective_remaining;
+    if (a.weekly_remaining != b.weekly_remaining) return a.weekly_remaining > b.weekly_remaining;
+    if (a.effective_resets_at != b.effective_resets_at) return a.effective_resets_at < b.effective_resets_at;
+    if (a.last_usage_at != b.last_usage_at) return a.last_usage_at > b.last_usage_at;
+    if (a.last_used_at != b.last_used_at) return a.last_used_at > b.last_used_at;
+
+    const a_primary = if (a.alias.len != 0) a.alias else a.email;
+    const b_primary = if (b.alias.len != 0) b.alias else b.email;
+    const primary_cmp = std.mem.order(u8, a_primary, b_primary);
+    if (primary_cmp != .eq) return primary_cmp == .lt;
+
+    const email_cmp = std.mem.order(u8, a.email, b.email);
+    if (email_cmp != .eq) return email_cmp == .lt;
+
+    return std.mem.order(u8, a.account_key, b.account_key) == .lt;
+}
+
+fn candidateRefreshBetter(a: CandidateScore, b: CandidateScore) bool {
+    if (a.refresh_only != b.refresh_only) return a.refresh_only;
+    return candidateBetter(a, b);
+}
+
+fn candidateScoreChangeAt(rec: *const registry.AccountRecord, now: i64) ?i64 {
+    if (rec.last_usage == null) return null;
     var next_change_at: ?i64 = null;
-    if (usage.?.primary) |window| {
+    if (rec.last_usage_at) |last_usage_at| {
+        next_change_at = earlierFutureTimestamp(
+            next_change_at,
+            last_usage_at + registry.local_snapshot_max_age_seconds + 1,
+            now,
+        );
+    }
+    if (rec.last_usage.?.primary) |window| {
         next_change_at = earlierFutureTimestamp(next_change_at, window.resets_at, now);
     }
-    if (usage.?.secondary) |window| {
+    if (rec.last_usage.?.secondary) |window| {
         next_change_at = earlierFutureTimestamp(next_change_at, window.resets_at, now);
     }
     return next_change_at;
@@ -2132,7 +3757,7 @@ pub fn linuxUnitText(allocator: std.mem.Allocator, self_exe: []const u8, codex_h
     defer allocator.free(escaped_version);
     return try std.fmt.allocPrint(
         allocator,
-        "[Unit]\nDescription=codex-auth auto-switch watcher\n\n[Service]\nType=simple\nRestart=always\nRestartSec=1\nEnvironment=\"{s}={s}\"\nExecStart={s}\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=codex-auth auto-switch watcher\n\n[Service]\nType=simple\nRestart=on-failure\nRestartSec=1\nEnvironment=\"{s}={s}\"\nExecStart={s}\n\n[Install]\nWantedBy=default.target\n",
         .{
             service_version_env_name,
             escaped_version,
@@ -2486,9 +4111,45 @@ test "candidate index refreshes cached ranking after a reset window expires" {
 
     try index.rebuild(gpa, &reg, 1000);
     try std.testing.expect(index.best() != null);
-    try std.testing.expect(std.mem.eql(u8, index.best().?.account_key, steady_account_key));
+    try std.testing.expect(std.mem.eql(u8, index.best().?.account_key, reset_account_key));
+    try std.testing.expect(index.best().?.score.refresh_only);
 
     try index.rebuildIfScoreExpired(gpa, &reg, 1011);
     try std.testing.expect(index.best() != null);
     try std.testing.expect(std.mem.eql(u8, index.best().?.account_key, reset_account_key));
+    try std.testing.expect(!index.best().?.score.refresh_only);
+}
+
+test "thread batch joins already spawned workers before returning a later spawn failure" {
+    const FakeThread = struct {
+        id: usize,
+    };
+    const State = struct {
+        joined_ids: [candidate_parallel_fetch_limit]usize = undefined,
+        join_count: usize = 0,
+    };
+
+    var state = State{};
+    var threads: [candidate_parallel_fetch_limit]FakeThread = undefined;
+
+    try std.testing.expectError(error.TestSpawnFailure, runThreadBatch(
+        FakeThread,
+        threads[0..candidate_parallel_fetch_limit],
+        &state,
+        struct {
+            fn spawn(_: *State, idx: usize) !FakeThread {
+                if (idx == 1) return error.TestSpawnFailure;
+                return .{ .id = idx };
+            }
+        }.spawn,
+        struct {
+            fn join(ctx: *State, thread: *FakeThread) void {
+                ctx.joined_ids[ctx.join_count] = thread.id;
+                ctx.join_count += 1;
+            }
+        }.join,
+    ));
+
+    try std.testing.expectEqual(@as(usize, 1), state.join_count);
+    try std.testing.expectEqual(@as(usize, 0), state.joined_ids[0]);
 }

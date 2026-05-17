@@ -42,9 +42,19 @@ pub const ImportOptions = struct {
     purge: bool,
     source: ImportSource,
 };
-pub const SwitchOptions = struct { query: ?[]u8 };
+pub const SwitchOptions = struct {
+    query: ?[]u8,
+    account_key: ?[]u8 = null,
+    best: bool = false,
+};
+pub const WarmOptions = struct {
+    query: ?[]u8,
+    account_key: ?[]u8 = null,
+    all: bool,
+};
 pub const RemoveOptions = struct {
     query: ?[]u8,
+    account_key: ?[]u8 = null,
     all: bool,
 };
 pub const CleanOptions = struct {};
@@ -55,6 +65,7 @@ pub const AutoThresholdOptions = struct {
 };
 pub const AutoOptions = union(enum) {
     action: AutoAction,
+    mode: registry.AutoSwitchMode,
     configure: AutoThresholdOptions,
 };
 pub const ApiAction = enum { enable, disable };
@@ -71,6 +82,7 @@ pub const HelpTopic = enum {
     login,
     import_auth,
     switch_account,
+    warm,
     remove_account,
     clean,
     config,
@@ -82,6 +94,7 @@ pub const Command = union(enum) {
     login: LoginOptions,
     import_auth: ImportOptions,
     switch_account: SwitchOptions,
+    warm: WarmOptions,
     remove_account: RemoveOptions,
     clean: CleanOptions,
     config: ConfigOptions,
@@ -231,20 +244,110 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Pars
         }
 
         var query: ?[]u8 = null;
+        var account_key: ?[]u8 = null;
+        var best = false;
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
             const arg = std.mem.sliceTo(args[i], 0);
+            if (std.mem.eql(u8, arg, "--best")) {
+                if (best or query != null or account_key != null) {
+                    if (query) |e| allocator.free(e);
+                    if (account_key) |key| allocator.free(key);
+                    return usageErrorResult(allocator, .switch_account, "`switch` cannot combine `--best` with another selector.", .{});
+                }
+                best = true;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--account-key")) {
+                if (i + 1 >= args.len) {
+                    if (query) |e| allocator.free(e);
+                    if (account_key) |key| allocator.free(key);
+                    return usageErrorResult(allocator, .switch_account, "`switch --account-key` requires a value.", .{});
+                }
+                if (best or query != null or account_key != null) {
+                    if (query) |e| allocator.free(e);
+                    if (account_key) |key| allocator.free(key);
+                    return usageErrorResult(allocator, .switch_account, "`switch` cannot combine `--account-key` with another selector.", .{});
+                }
+                account_key = try allocator.dupe(u8, std.mem.sliceTo(args[i + 1], 0));
+                i += 1;
+                continue;
+            }
             if (std.mem.startsWith(u8, arg, "-")) {
                 if (query) |e| allocator.free(e);
+                if (account_key) |key| allocator.free(key);
                 return usageErrorResult(allocator, .switch_account, "unknown flag `{s}` for `switch`.", .{arg});
             }
-            if (query != null) {
+            if (query != null or best or account_key != null) {
                 if (query) |e| allocator.free(e);
+                if (account_key) |key| allocator.free(key);
+                if (best) {
+                    return usageErrorResult(allocator, .switch_account, "`switch` cannot combine `--best` with another selector.", .{});
+                }
+                if (account_key != null) {
+                    return usageErrorResult(allocator, .switch_account, "`switch` cannot combine `--account-key` with another selector.", .{});
+                }
                 return usageErrorResult(allocator, .switch_account, "unexpected extra query `{s}` for `switch`.", .{arg});
             }
             query = try allocator.dupe(u8, arg);
         }
-        return .{ .command = .{ .switch_account = .{ .query = query } } };
+        return .{ .command = .{ .switch_account = .{ .query = query, .account_key = account_key, .best = best } } };
+    }
+
+    if (std.mem.eql(u8, cmd, "warm")) {
+        if (args.len == 3 and isHelpFlag(std.mem.sliceTo(args[2], 0))) {
+            return .{ .command = .{ .help = .warm } };
+        }
+
+        var query: ?[]u8 = null;
+        var account_key: ?[]u8 = null;
+        var all = false;
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            const arg = std.mem.sliceTo(args[i], 0);
+            if (std.mem.eql(u8, arg, "--all")) {
+                if (all or query != null or account_key != null) {
+                    if (query) |q| allocator.free(q);
+                    if (account_key) |key| allocator.free(key);
+                    return usageErrorResult(allocator, .warm, "`warm` cannot combine `--all` with another selector.", .{});
+                }
+                all = true;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--account-key")) {
+                if (i + 1 >= args.len) {
+                    if (query) |q| allocator.free(q);
+                    if (account_key) |key| allocator.free(key);
+                    return usageErrorResult(allocator, .warm, "`warm --account-key` requires a value.", .{});
+                }
+                if (all or query != null or account_key != null) {
+                    if (query) |q| allocator.free(q);
+                    if (account_key) |key| allocator.free(key);
+                    return usageErrorResult(allocator, .warm, "`warm` cannot combine `--account-key` with another selector.", .{});
+                }
+                account_key = try allocator.dupe(u8, std.mem.sliceTo(args[i + 1], 0));
+                i += 1;
+                continue;
+            }
+            if (std.mem.startsWith(u8, arg, "-")) {
+                if (query) |q| allocator.free(q);
+                if (account_key) |key| allocator.free(key);
+                return usageErrorResult(allocator, .warm, "unknown flag `{s}` for `warm`.", .{arg});
+            }
+            if (query != null or all or account_key != null) {
+                if (query) |q| allocator.free(q);
+                if (account_key) |key| allocator.free(key);
+                if (all) {
+                    return usageErrorResult(allocator, .warm, "`warm` cannot combine `--all` with another selector.", .{});
+                }
+                if (account_key != null) {
+                    return usageErrorResult(allocator, .warm, "`warm` cannot combine `--account-key` with another selector.", .{});
+                }
+                return usageErrorResult(allocator, .warm, "unexpected extra selector `{s}` for `warm`.", .{arg});
+            }
+            query = try allocator.dupe(u8, arg);
+        }
+        return .{ .command = .{ .warm = .{ .query = query, .account_key = account_key, .all = all } } };
     }
 
     if (std.mem.eql(u8, cmd, "remove")) {
@@ -253,32 +356,54 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Pars
         }
 
         var query: ?[]u8 = null;
+        var account_key: ?[]u8 = null;
         var all = false;
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
             const arg = std.mem.sliceTo(args[i], 0);
             if (std.mem.eql(u8, arg, "--all")) {
-                if (all or query != null) {
+                if (all or query != null or account_key != null) {
                     if (query) |q| allocator.free(q);
+                    if (account_key) |key| allocator.free(key);
                     return usageErrorResult(allocator, .remove_account, "`remove` cannot combine `--all` with another selector.", .{});
                 }
                 all = true;
                 continue;
             }
+            if (std.mem.eql(u8, arg, "--account-key")) {
+                if (i + 1 >= args.len) {
+                    if (query) |q| allocator.free(q);
+                    if (account_key) |key| allocator.free(key);
+                    return usageErrorResult(allocator, .remove_account, "`remove --account-key` requires a value.", .{});
+                }
+                if (all or query != null or account_key != null) {
+                    if (query) |q| allocator.free(q);
+                    if (account_key) |key| allocator.free(key);
+                    return usageErrorResult(allocator, .remove_account, "`remove` cannot combine `--account-key` with another selector.", .{});
+                }
+                account_key = try allocator.dupe(u8, std.mem.sliceTo(args[i + 1], 0));
+                i += 1;
+                continue;
+            }
             if (std.mem.startsWith(u8, arg, "-")) {
                 if (query) |q| allocator.free(q);
+                if (account_key) |key| allocator.free(key);
                 return usageErrorResult(allocator, .remove_account, "unknown flag `{s}` for `remove`.", .{arg});
             }
-            if (query != null or all) {
+            if (query != null or account_key != null or all) {
                 if (query) |q| allocator.free(q);
+                if (account_key) |key| allocator.free(key);
                 if (all) {
                     return usageErrorResult(allocator, .remove_account, "`remove` cannot combine `--all` with another selector.", .{});
+                }
+                if (account_key != null) {
+                    return usageErrorResult(allocator, .remove_account, "`remove` cannot combine `--account-key` with another selector.", .{});
                 }
                 return usageErrorResult(allocator, .remove_account, "unexpected extra selector `{s}` for `remove`.", .{arg});
             }
             query = try allocator.dupe(u8, arg);
         }
-        return .{ .command = .{ .remove_account = .{ .query = query, .all = all } } };
+        return .{ .command = .{ .remove_account = .{ .query = query, .account_key = account_key, .all = all } } };
     }
 
     if (std.mem.eql(u8, cmd, "clean")) {
@@ -305,6 +430,17 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Pars
                 if (std.mem.eql(u8, action, "enable")) return .{ .command = .{ .config = .{ .auto_switch = .{ .action = .enable } } } };
                 if (std.mem.eql(u8, action, "disable")) return .{ .command = .{ .config = .{ .auto_switch = .{ .action = .disable } } } };
             }
+            if (args.len >= 4 and std.mem.eql(u8, std.mem.sliceTo(args[3], 0), "mode")) {
+                if (args.len != 5) {
+                    return usageErrorResult(allocator, .config, "`config auto mode` requires `reactive`, `proactive`, `pinned`, or `failover`.", .{});
+                }
+                const mode_arg = std.mem.sliceTo(args[4], 0);
+                if (std.mem.eql(u8, mode_arg, "reactive")) return .{ .command = .{ .config = .{ .auto_switch = .{ .mode = .reactive } } } };
+                if (std.mem.eql(u8, mode_arg, "proactive")) return .{ .command = .{ .config = .{ .auto_switch = .{ .mode = .proactive } } } };
+                if (std.mem.eql(u8, mode_arg, "pinned")) return .{ .command = .{ .config = .{ .auto_switch = .{ .mode = .pinned } } } };
+                if (std.mem.eql(u8, mode_arg, "failover")) return .{ .command = .{ .config = .{ .auto_switch = .{ .mode = .failover } } } };
+                return usageErrorResult(allocator, .config, "unknown mode `{s}` for `config auto mode`.", .{mode_arg});
+            }
 
             var threshold_5h_percent: ?u8 = null;
             var threshold_weekly_percent: ?u8 = null;
@@ -329,6 +465,9 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Pars
                 }
                 if (std.mem.eql(u8, arg, "enable") or std.mem.eql(u8, arg, "disable")) {
                     return usageErrorResult(allocator, .config, "`config auto` cannot mix actions with threshold flags.", .{});
+                }
+                if (std.mem.eql(u8, arg, "mode")) {
+                    return usageErrorResult(allocator, .config, "`config auto` cannot mix mode changes with threshold flags.", .{});
                 }
                 return usageErrorResult(allocator, .config, "unknown argument `{s}` for `config auto`.", .{arg});
             }
@@ -386,9 +525,15 @@ fn freeCommand(allocator: std.mem.Allocator, cmd: *Command) void {
         },
         .switch_account => |*opts| {
             if (opts.query) |e| allocator.free(e);
+            if (opts.account_key) |key| allocator.free(key);
+        },
+        .warm => |*opts| {
+            if (opts.query) |q| allocator.free(q);
+            if (opts.account_key) |key| allocator.free(key);
         },
         .remove_account => |*opts| {
             if (opts.query) |q| allocator.free(q);
+            if (opts.account_key) |key| allocator.free(key);
         },
         else => {},
     }
@@ -449,6 +594,7 @@ fn helpTopicForName(name: []const u8) ?HelpTopic {
     if (std.mem.eql(u8, name, "login")) return .login;
     if (std.mem.eql(u8, name, "import")) return .import_auth;
     if (std.mem.eql(u8, name, "switch")) return .switch_account;
+    if (std.mem.eql(u8, name, "warm")) return .warm;
     if (std.mem.eql(u8, name, "remove")) return .remove_account;
     if (std.mem.eql(u8, name, "clean")) return .clean;
     if (std.mem.eql(u8, name, "config")) return .config;
@@ -517,11 +663,12 @@ pub fn writeHelp(
     const commands = [_]HelpEntry{
         .{ .name = "--version, -V", .description = "Show version" },
         .{ .name = "list", .description = "List available accounts" },
-        .{ .name = "status", .description = "Show auto-switch and usage API status" },
+        .{ .name = "status", .description = "Show auto-switch, auth, service, and API status" },
         .{ .name = "login", .description = "Login and add the current account" },
         .{ .name = "import", .description = "Import auth files or rebuild registry" },
-        .{ .name = "switch [<query>]", .description = "Switch the active account" },
-        .{ .name = "remove [<query>|--all]", .description = "Remove one or more accounts" },
+        .{ .name = "switch [<query>|--best|--account-key <record_key>]", .description = "Switch the active account" },
+        .{ .name = "warm [<query>|--all|--account-key <record_key>]", .description = "Seed fresh local usage snapshots" },
+        .{ .name = "remove [<query>|--account-key <record_key>|--all]", .description = "Remove one or more accounts" },
         .{ .name = "clean", .description = "Delete backup and stale files under accounts/" },
         .{ .name = "config", .description = "Manage configuration" },
     };
@@ -534,6 +681,7 @@ pub fn writeHelp(
     const config_details = [_]HelpEntry{
         .{ .name = "auto enable", .description = "Enable background auto-switching" },
         .{ .name = "auto disable", .description = "Disable background auto-switching" },
+        .{ .name = "auto mode <reactive|proactive|pinned|failover>", .description = "Choose how auto-switch behaves" },
         .{ .name = "auto --5h <percent> [--weekly <percent>]", .description = "Configure auto-switch thresholds" },
         .{ .name = "api enable", .description = "Enable usage and account APIs" },
         .{ .name = "api disable", .description = "Disable usage and account APIs" },
@@ -558,11 +706,13 @@ pub fn writeHelp(
     try writeHelpEntry(out, use_color, parent_indent, command_col, commands[6].name, commands[6].description);
     try writeHelpEntry(out, use_color, parent_indent, command_col, commands[7].name, commands[7].description);
     try writeHelpEntry(out, use_color, parent_indent, command_col, commands[8].name, commands[8].description);
+    try writeHelpEntry(out, use_color, parent_indent, command_col, commands[9].name, commands[9].description);
     try writeHelpEntry(out, use_color, child_indent, config_detail_col, config_details[0].name, config_details[0].description);
     try writeHelpEntry(out, use_color, child_indent, config_detail_col, config_details[1].name, config_details[1].description);
     try writeHelpEntry(out, use_color, child_indent, config_detail_col, config_details[2].name, config_details[2].description);
     try writeHelpEntry(out, use_color, child_indent, config_detail_col, config_details[3].name, config_details[3].description);
     try writeHelpEntry(out, use_color, child_indent, config_detail_col, config_details[4].name, config_details[4].description);
+    try writeHelpEntry(out, use_color, child_indent, config_detail_col, config_details[5].name, config_details[5].description);
 
     try out.writeAll("\n");
     if (use_color) try out.writeAll(ansi.bold);
@@ -653,6 +803,7 @@ fn commandNameForTopic(topic: HelpTopic) []const u8 {
         .login => "login",
         .import_auth => "import",
         .switch_account => "switch",
+        .warm => "warm",
         .remove_account => "remove",
         .clean => "clean",
         .config => "config",
@@ -664,10 +815,11 @@ fn commandDescriptionForTopic(topic: HelpTopic) []const u8 {
     return switch (topic) {
         .top_level => "Command-line account management for Codex.",
         .list => "List available accounts.",
-        .status => "Show auto-switch, service, and usage API status.",
+        .status => "Show auto-switch, auth, service, and API status.",
         .login => "Run `codex login` or `codex login --device-auth`, then add the current account.",
         .import_auth => "Import auth files or rebuild the registry.",
-        .switch_account => "Switch the active account interactively or by query.",
+        .switch_account => "Switch the active account interactively, by query, or by exact record key.",
+        .warm => "Seed fresh local-only usage snapshots for one or more accounts by query or exact record key.",
         .remove_account => "Remove one or more accounts.",
         .clean => "Delete backup and stale files under accounts/.",
         .config => "Manage auto-switch and usage API configuration.",
@@ -677,7 +829,7 @@ fn commandDescriptionForTopic(topic: HelpTopic) []const u8 {
 
 fn commandHelpHasExamples(topic: HelpTopic) bool {
     return switch (topic) {
-        .import_auth, .switch_account, .remove_account, .config, .daemon => true,
+        .import_auth, .switch_account, .warm, .remove_account, .config, .daemon => true,
         else => false,
     };
 }
@@ -704,16 +856,26 @@ fn writeUsageSection(out: *std.Io.Writer, topic: HelpTopic) !void {
         .switch_account => {
             try out.writeAll("  codex-auth switch\n");
             try out.writeAll("  codex-auth switch <query>\n");
+            try out.writeAll("  codex-auth switch --best\n");
+            try out.writeAll("  codex-auth switch --account-key <record_key>\n");
+        },
+        .warm => {
+            try out.writeAll("  codex-auth warm\n");
+            try out.writeAll("  codex-auth warm <query>\n");
+            try out.writeAll("  codex-auth warm --all\n");
+            try out.writeAll("  codex-auth warm --account-key <record_key>\n");
         },
         .remove_account => {
             try out.writeAll("  codex-auth remove\n");
             try out.writeAll("  codex-auth remove <query>\n");
+            try out.writeAll("  codex-auth remove --account-key <record_key>\n");
             try out.writeAll("  codex-auth remove --all\n");
         },
         .clean => try out.writeAll("  codex-auth clean\n"),
         .config => {
             try out.writeAll("  codex-auth config auto enable\n");
             try out.writeAll("  codex-auth config auto disable\n");
+            try out.writeAll("  codex-auth config auto mode <reactive|proactive|pinned|failover>\n");
             try out.writeAll("  codex-auth config auto --5h <percent> [--weekly <percent>]\n");
             try out.writeAll("  codex-auth config auto --weekly <percent>\n");
             try out.writeAll("  codex-auth config api enable\n");
@@ -748,14 +910,26 @@ fn writeExamplesSection(out: *std.Io.Writer, topic: HelpTopic) !void {
         .switch_account => {
             try out.writeAll("  codex-auth switch\n");
             try out.writeAll("  codex-auth switch john@example.com\n");
+            try out.writeAll("  codex-auth switch --best\n");
+            try out.writeAll("  codex-auth switch --account-key user-abc::workspace-id\n");
+        },
+        .warm => {
+            try out.writeAll("  codex-auth warm\n");
+            try out.writeAll("  codex-auth warm work\n");
+            try out.writeAll("  codex-auth warm --all\n");
+            try out.writeAll("  codex-auth warm --account-key user-abc::workspace-id\n");
         },
         .remove_account => {
             try out.writeAll("  codex-auth remove\n");
             try out.writeAll("  codex-auth remove john@example.com\n");
+            try out.writeAll("  codex-auth remove --account-key user-abc::workspace-id\n");
             try out.writeAll("  codex-auth remove --all\n");
         },
         .clean => try out.writeAll("  codex-auth clean\n"),
         .config => {
+            try out.writeAll("  codex-auth config auto mode proactive\n");
+            try out.writeAll("  codex-auth config auto mode pinned\n");
+            try out.writeAll("  codex-auth config auto mode failover\n");
             try out.writeAll("  codex-auth config auto --5h 12 --weekly 8\n");
             try out.writeAll("  codex-auth config api enable\n");
         },
@@ -788,6 +962,7 @@ fn helpCommandForTopic(topic: HelpTopic) []const u8 {
         .login => "codex-auth login --help",
         .import_auth => "codex-auth import --help",
         .switch_account => "codex-auth switch --help",
+        .warm => "codex-auth warm --help",
         .remove_account => "codex-auth remove --help",
         .clean => "codex-auth clean --help",
         .config => "codex-auth config --help",
@@ -881,6 +1056,30 @@ pub fn printAccountNotFoundError(query: []const u8) !void {
     const use_color = stderrColorEnabled();
     try writeErrorPrefixTo(out, use_color);
     try out.print(" no account matches '{s}'.\n", .{query});
+    try out.flush();
+}
+
+pub fn printNoActiveAccountError(command_name: []const u8) !void {
+    var buffer: [512]u8 = undefined;
+    var writer = std.fs.File.stderr().writer(&buffer);
+    const out = &writer.interface;
+    const use_color = stderrColorEnabled();
+    try writeErrorPrefixTo(out, use_color);
+    try out.print(" `{s}` requires an active account.\n", .{command_name});
+    try writeHintPrefixTo(out, use_color);
+    try out.writeAll(" Switch to an account first, or pass a query or `--all`.\n");
+    try out.flush();
+}
+
+pub fn printNoKnownQuotaAccountError() !void {
+    var buffer: [512]u8 = undefined;
+    var writer = std.fs.File.stderr().writer(&buffer);
+    const out = &writer.interface;
+    const use_color = stderrColorEnabled();
+    try writeErrorPrefixTo(out, use_color);
+    try out.writeAll(" no account has a fresh known quota snapshot.\n");
+    try writeHintPrefixTo(out, use_color);
+    try out.writeAll(" Warm accounts first with `codex-auth warm --all`, or switch by query or exact account key.\n");
     try out.flush();
 }
 
@@ -1808,10 +2007,11 @@ fn buildSwitchRows(allocator: std.mem.Allocator, reg: *registry.Registry) !Switc
         if (display_row.account_index) |account_idx| {
             const rec = reg.accounts.items[account_idx];
             const plan = if (registry.resolvePlan(&rec)) |p| @tagName(p) else "-";
+            const freshness = registry.accountSnapshotFreshness(&rec, now);
             const rate_5h = resolveRateWindow(rec.last_usage, 300, true);
             const rate_week = resolveRateWindow(rec.last_usage, 10080, false);
-            const rate_5h_str = try formatRateLimitSwitchAlloc(allocator, rate_5h);
-            const rate_week_str = try formatRateLimitSwitchAlloc(allocator, rate_week);
+            const rate_5h_str = try formatRateLimitSwitchAlloc(allocator, rate_5h, freshness);
+            const rate_week_str = try formatRateLimitSwitchAlloc(allocator, rate_week, freshness);
             const last = try timefmt.formatRelativeTimeOrDashAlloc(allocator, rec.last_usage_at, now);
             rows[i] = .{
                 .account_index = account_idx,
@@ -1870,10 +2070,11 @@ fn buildSwitchRowsFromIndices(
         if (display_row.account_index) |account_idx| {
             const rec = reg.accounts.items[account_idx];
             const plan = if (registry.resolvePlan(&rec)) |p| @tagName(p) else "-";
+            const freshness = registry.accountSnapshotFreshness(&rec, now);
             const rate_5h = resolveRateWindow(rec.last_usage, 300, true);
             const rate_week = resolveRateWindow(rec.last_usage, 10080, false);
-            const rate_5h_str = try formatRateLimitSwitchAlloc(allocator, rate_5h);
-            const rate_week_str = try formatRateLimitSwitchAlloc(allocator, rate_week);
+            const rate_5h_str = try formatRateLimitSwitchAlloc(allocator, rate_5h, freshness);
+            const rate_week_str = try formatRateLimitSwitchAlloc(allocator, rate_week, freshness);
             const last = try timefmt.formatRelativeTimeOrDashAlloc(allocator, rec.last_usage_at, now);
             rows[i] = .{
                 .account_index = account_idx,
@@ -1923,7 +2124,16 @@ fn resolveRateWindow(usage: ?registry.RateLimitSnapshot, minutes: i64, fallback_
     return if (fallback_primary) usage.?.primary else usage.?.secondary;
 }
 
-fn formatRateLimitSwitchAlloc(allocator: std.mem.Allocator, window: ?registry.RateLimitWindow) ![]u8 {
+fn formatRateLimitSwitchAlloc(
+    allocator: std.mem.Allocator,
+    window: ?registry.RateLimitWindow,
+    freshness: registry.SnapshotFreshness,
+) ![]u8 {
+    switch (freshness) {
+        .unknown => return try std.fmt.allocPrint(allocator, "unknown", .{}),
+        .stale => return try std.fmt.allocPrint(allocator, "stale", .{}),
+        .fresh => {},
+    }
     if (window == null) return try std.fmt.allocPrint(allocator, "-", .{});
     if (window.?.resets_at == null) return try std.fmt.allocPrint(allocator, "-", .{});
     const now = std.time.timestamp();

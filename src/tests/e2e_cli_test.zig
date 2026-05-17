@@ -61,6 +61,68 @@ fn fakeCodexCommandPath() []const u8 {
     return if (builtin.os.tag == .windows) "fake-bin/codex.cmd" else "fake-bin/codex";
 }
 
+fn fakeCodextCommandPath() []const u8 {
+    return if (builtin.os.tag == .windows) "fake-bin/codext.cmd" else "fake-bin/codext";
+}
+
+fn warmRolloutLine() []const u8 {
+    return "{\"timestamp\":\"2099-01-01T00:00:01.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"rate_limits\":{\"primary\":{\"used_percent\":12.0,\"window_minutes\":300,\"resets_at\":4070908800},\"secondary\":{\"used_percent\":18.0,\"window_minutes\":10080,\"resets_at\":4071427200},\"plan_type\":\"pro\"}}}";
+}
+
+fn writeFakeWarmRunner(
+    dir: std.fs.Dir,
+    sub_path: []const u8,
+    marker_name: []const u8,
+    create_rollout: bool,
+    exit_code: u8,
+) !void {
+    const rollout_line = warmRolloutLine();
+    const script = if (builtin.os.tag == .windows)
+        try std.fmt.allocPrint(
+            std.testing.allocator,
+            "@echo off\r\nsetlocal\r\n>\"%~dp0..\\{s}\" echo %*\r\nif \"{s}\"==\"1\" (\r\n  mkdir \"%HOME%\\.codex\\sessions\\2099\\01\\01\" 2>NUL\r\n  >\"%HOME%\\.codex\\sessions\\2099\\01\\01\\rollout-warm.jsonl\" echo {s}\r\n)\r\nexit /b {d}\r\n",
+            .{ marker_name, if (create_rollout) "1" else "0", rollout_line, exit_code },
+        )
+    else
+        try std.fmt.allocPrint(
+            std.testing.allocator,
+            "#!/bin/sh\nscript_dir=$(dirname \"$0\")\nprintf '%s\\n' \"$*\" > \"$script_dir/../{s}\"\nif [ \"{s}\" = \"1\" ]; then\n  mkdir -p \"$HOME/.codex/sessions/2099/01/01\"\n  cat > \"$HOME/.codex/sessions/2099/01/01/rollout-warm.jsonl\" <<'EOF'\n{s}\nEOF\nfi\nexit {d}\n",
+            .{ marker_name, if (create_rollout) "1" else "0", rollout_line, exit_code },
+        );
+    defer std.testing.allocator.free(script);
+
+    try dir.writeFile(.{ .sub_path = sub_path, .data = script });
+    if (builtin.os.tag != .windows) {
+        var file = try dir.openFile(sub_path, .{ .mode = .read_write });
+        defer file.close();
+        try file.chmod(0o755);
+    }
+}
+
+fn writeFakeWarmRunnerFailThenSucceed(dir: std.fs.Dir, sub_path: []const u8, marker_name: []const u8) !void {
+    const rollout_line = warmRolloutLine();
+    const script = if (builtin.os.tag == .windows)
+        try std.fmt.allocPrint(
+            std.testing.allocator,
+            "@echo off\r\nsetlocal\r\nset COUNT_FILE=%~dp0..\\warm-count.txt\r\n>\"%~dp0..\\{s}\" echo %*\r\nif exist \"%COUNT_FILE%\" (set /p COUNT=<\"%COUNT_FILE%\") else set COUNT=0\r\nset /a COUNT=%COUNT%+1\r\n>\"%COUNT_FILE%\" echo %COUNT%\r\nif \"%COUNT%\"==\"1\" exit /b 0\r\nmkdir \"%HOME%\\.codex\\sessions\\2099\\01\\01\" 2>NUL\r\n>\"%HOME%\\.codex\\sessions\\2099\\01\\01\\rollout-warm.jsonl\" echo {s}\r\nexit /b 0\r\n",
+            .{ marker_name, rollout_line },
+        )
+    else
+        try std.fmt.allocPrint(
+            std.testing.allocator,
+            "#!/bin/sh\nscript_dir=$(dirname \"$0\")\ncount_file=\"$script_dir/../warm-count.txt\"\nprintf '%s\\n' \"$*\" > \"$script_dir/../{s}\"\nif [ -f \"$count_file\" ]; then\n  count=$(cat \"$count_file\")\nelse\n  count=0\nfi\ncount=$((count + 1))\nprintf '%s' \"$count\" > \"$count_file\"\nif [ \"$count\" = \"1\" ]; then\n  exit 0\nfi\nmkdir -p \"$HOME/.codex/sessions/2099/01/01\"\ncat > \"$HOME/.codex/sessions/2099/01/01/rollout-warm.jsonl\" <<'EOF'\n{s}\nEOF\nexit 0\n",
+            .{ marker_name, rollout_line },
+        );
+    defer std.testing.allocator.free(script);
+
+    try dir.writeFile(.{ .sub_path = sub_path, .data = script });
+    if (builtin.os.tag != .windows) {
+        var file = try dir.openFile(sub_path, .{ .mode = .read_write });
+        defer file.close();
+        try file.chmod(0o755);
+    }
+}
+
 fn writeFailingFakeCodex(dir: std.fs.Dir, exit_code: u8) !void {
     var script_buf: [128]u8 = undefined;
     const script = if (builtin.os.tag == .windows)
@@ -105,6 +167,29 @@ fn prependPathEntryAlloc(allocator: std.mem.Allocator, entry: []const u8) ![]u8 
 
     const inherited_path = env_map.get("PATH") orelse return allocator.dupe(u8, entry);
     return try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ entry, std.fs.path.delimiter, inherited_path });
+}
+
+fn runnerPathOverrideAlloc(allocator: std.mem.Allocator, entry: []const u8) ![]u8 {
+    if (builtin.os.tag == .windows) {
+        const system_root = std.process.getEnvVarOwned(allocator, "SystemRoot") catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => return allocator.dupe(u8, entry),
+            else => return err,
+        };
+        defer allocator.free(system_root);
+        const system32 = try std.fs.path.join(allocator, &[_][]const u8{ system_root, "System32" });
+        defer allocator.free(system32);
+        return try std.fmt.allocPrint(
+            allocator,
+            "{s}{c}{s}{c}{s}",
+            .{ entry, std.fs.path.delimiter, system32, std.fs.path.delimiter, system_root },
+        );
+    }
+
+    return try std.fmt.allocPrint(
+        allocator,
+        "{s}{c}/usr/bin{c}/bin",
+        .{ entry, std.fs.path.delimiter, std.fs.path.delimiter },
+    );
 }
 
 fn runCliWithIsolatedHome(
@@ -258,6 +343,14 @@ fn countAuthBackups(dir: std.fs.Dir, rel_path: []const u8) !usize {
     return count;
 }
 
+fn pathExists(path: []const u8) !bool {
+    std.fs.cwd().access(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
 fn legacySnapshotNameForEmail(allocator: std.mem.Allocator, email: []const u8) ![]u8 {
     const encoded = try bdd.b64url(allocator, email);
     defer allocator.free(encoded);
@@ -283,6 +376,52 @@ fn seedRegistryWithAccounts(
     const active_key = try bdd.accountKeyForEmailAlloc(allocator, active_email);
     reg.active_account_key = active_key;
     reg.active_account_activated_at_ms = std.time.milliTimestamp();
+    try registry.saveRegistry(allocator, codex_home, &reg);
+}
+
+fn writeSeedAccountSnapshot(
+    allocator: std.mem.Allocator,
+    home_root: []const u8,
+    email: []const u8,
+    plan: []const u8,
+) !void {
+    const codex_home = try codexHomeAlloc(allocator, home_root);
+    defer allocator.free(codex_home);
+    const account_key = try bdd.accountKeyForEmailAlloc(allocator, email);
+    defer allocator.free(account_key);
+    const auth_path = try registry.accountAuthPath(allocator, codex_home, account_key);
+    defer allocator.free(auth_path);
+    const auth_json = try bdd.authJsonWithEmailPlan(allocator, email, plan);
+    defer allocator.free(auth_json);
+    try std.fs.cwd().writeFile(.{ .sub_path = auth_path, .data = auth_json });
+}
+
+fn seedAccountUsage(
+    allocator: std.mem.Allocator,
+    home_root: []const u8,
+    email: []const u8,
+    primary_used_percent: f64,
+    secondary_used_percent: ?f64,
+) !void {
+    const codex_home = try codexHomeAlloc(allocator, home_root);
+    defer allocator.free(codex_home);
+
+    var reg = try registry.loadRegistry(allocator, codex_home);
+    defer reg.deinit(allocator);
+
+    const account_key = try bdd.accountKeyForEmailAlloc(allocator, email);
+    defer allocator.free(account_key);
+    const idx = registry.findAccountIndexByAccountKey(&reg, account_key) orelse return error.AccountNotFound;
+    reg.accounts.items[idx].last_usage = .{
+        .primary = .{ .used_percent = primary_used_percent, .window_minutes = 300, .resets_at = std.time.timestamp() + 3600 },
+        .secondary = if (secondary_used_percent) |used|
+            .{ .used_percent = used, .window_minutes = 10080, .resets_at = std.time.timestamp() + 86400 }
+        else
+            null,
+        .credits = null,
+        .plan_type = .pro,
+    };
+    reg.accounts.items[idx].last_usage_at = std.time.timestamp();
     try registry.saveRegistry(allocator, codex_home, &reg);
 }
 
@@ -336,7 +475,7 @@ test "Scenario: Given device auth login when running login then it forwards the 
 
     const fake_bin_path = try std.fs.path.join(gpa, &[_][]const u8{ home_root, "fake-bin" });
     defer gpa.free(fake_bin_path);
-    const path_override = try prependPathEntryAlloc(gpa, fake_bin_path);
+    const path_override = try runnerPathOverrideAlloc(gpa, fake_bin_path);
     defer gpa.free(path_override);
 
     const result = try runCliWithIsolatedHomeAndPath(
@@ -405,7 +544,7 @@ test "Scenario: Given failed device auth login with existing auth json when runn
 
     const fake_bin_path = try std.fs.path.join(gpa, &[_][]const u8{ home_root, "fake-bin" });
     defer gpa.free(fake_bin_path);
-    const path_override = try prependPathEntryAlloc(gpa, fake_bin_path);
+    const path_override = try runnerPathOverrideAlloc(gpa, fake_bin_path);
     defer gpa.free(path_override);
 
     const result = try runCliWithIsolatedHomeAndPath(
@@ -435,6 +574,191 @@ test "Scenario: Given failed device auth login with existing auth json when runn
     const active_auth = try bdd.readFileAlloc(gpa, active_auth_path);
     defer gpa.free(active_auth);
     try std.testing.expectEqualStrings(existing_auth, active_auth);
+}
+
+test "Scenario: Given warm with both codext and codex in PATH when running then codext is preferred" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+    try tmp.dir.makePath("fake-bin");
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "active@example.com", .alias = "active" },
+    });
+    try writeSeedAccountSnapshot(gpa, home_root, "active@example.com", "pro");
+    try writeFakeWarmRunner(tmp.dir, fakeCodextCommandPath(), "codext-marker.txt", true, 0);
+    try writeFakeWarmRunner(tmp.dir, fakeCodexCommandPath(), "codex-marker.txt", true, 0);
+
+    const fake_bin_path = try std.fs.path.join(gpa, &[_][]const u8{ home_root, "fake-bin" });
+    defer gpa.free(fake_bin_path);
+    const path_override = try runnerPathOverrideAlloc(gpa, fake_bin_path);
+    defer gpa.free(path_override);
+
+    const result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        path_override,
+        &[_][]const u8{ "warm", "--all" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "updated active@example.com") != null);
+
+    const codext_marker = try std.fs.path.join(gpa, &[_][]const u8{ home_root, "codext-marker.txt" });
+    defer gpa.free(codext_marker);
+    const codex_marker = try std.fs.path.join(gpa, &[_][]const u8{ home_root, "codex-marker.txt" });
+    defer gpa.free(codex_marker);
+    try std.testing.expect(try pathExists(codext_marker));
+    try std.testing.expect(!(try pathExists(codex_marker)));
+
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+    try std.testing.expect(!(try pathExists(active_auth_path)));
+}
+
+test "Scenario: Given warm with codext missing when running then it falls back to codex" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+    try tmp.dir.makePath("fake-bin");
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "active@example.com", .alias = "active" },
+    });
+    try writeSeedAccountSnapshot(gpa, home_root, "active@example.com", "pro");
+    try writeFakeWarmRunner(tmp.dir, fakeCodexCommandPath(), "codex-marker.txt", true, 0);
+
+    const fake_bin_path = try std.fs.path.join(gpa, &[_][]const u8{ home_root, "fake-bin" });
+    defer gpa.free(fake_bin_path);
+    const path_override = try runnerPathOverrideAlloc(gpa, fake_bin_path);
+    defer gpa.free(path_override);
+
+    const result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        path_override,
+        &[_][]const u8{ "warm", "--all" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "updated active@example.com") != null);
+
+    const codext_marker = try std.fs.path.join(gpa, &[_][]const u8{ home_root, "codext-marker.txt" });
+    defer gpa.free(codext_marker);
+    const codex_marker = try std.fs.path.join(gpa, &[_][]const u8{ home_root, "codex-marker.txt" });
+    defer gpa.free(codex_marker);
+    try std.testing.expect(!(try pathExists(codext_marker)));
+    try std.testing.expect(try pathExists(codex_marker));
+}
+
+test "Scenario: Given warm with exact account key when running then it warms only the selected tracked account" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+    try tmp.dir.makePath("fake-bin");
+
+    try seedRegistryWithAccounts(gpa, home_root, "alpha@example.com", &[_]SeedAccount{
+        .{ .email = "alpha@example.com", .alias = "team-alpha" },
+        .{ .email = "beta@example.com", .alias = "team-beta" },
+    });
+    try writeSeedAccountSnapshot(gpa, home_root, "alpha@example.com", "pro");
+    try writeSeedAccountSnapshot(gpa, home_root, "beta@example.com", "pro");
+    try writeFakeWarmRunner(tmp.dir, fakeCodextCommandPath(), "codext-marker.txt", true, 0);
+
+    const target_account_key = try bdd.accountKeyForEmailAlloc(gpa, "beta@example.com");
+    defer gpa.free(target_account_key);
+
+    const fake_bin_path = try std.fs.path.join(gpa, &[_][]const u8{ home_root, "fake-bin" });
+    defer gpa.free(fake_bin_path);
+    const path_override = try runnerPathOverrideAlloc(gpa, fake_bin_path);
+    defer gpa.free(path_override);
+
+    const result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        path_override,
+        &[_][]const u8{ "warm", "--account-key", target_account_key },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "updated beta@example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "alpha@example.com") == null);
+}
+
+test "Scenario: Given warm all when the first runner invocation produces no rollout then it still prints a mixed summary for all accounts" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+    try tmp.dir.makePath("fake-bin");
+
+    try seedRegistryWithAccounts(gpa, home_root, "alpha@example.com", &[_]SeedAccount{
+        .{ .email = "alpha@example.com", .alias = "alpha" },
+        .{ .email = "beta@example.com", .alias = "beta" },
+    });
+    try writeSeedAccountSnapshot(gpa, home_root, "alpha@example.com", "pro");
+    try writeSeedAccountSnapshot(gpa, home_root, "beta@example.com", "pro");
+    try writeFakeWarmRunnerFailThenSucceed(tmp.dir, fakeCodextCommandPath(), "codext-marker.txt");
+
+    const fake_bin_path = try std.fs.path.join(gpa, &[_][]const u8{ home_root, "fake-bin" });
+    defer gpa.free(fake_bin_path);
+    const path_override = try runnerPathOverrideAlloc(gpa, fake_bin_path);
+    defer gpa.free(path_override);
+
+    const result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        path_override,
+        &[_][]const u8{ "warm", "--all" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "failed alpha@example.com RolloutMissing") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "updated beta@example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "warm summary: updated=1, unknown=0, failed=1") != null);
 }
 
 // This simulates first-time use on v0.2 when ~/.codex/auth.json already exists
@@ -1112,6 +1436,7 @@ test "Scenario: Given active account removal with a replacement when running rem
     try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = active_auth });
     try std.fs.cwd().writeFile(.{ .sub_path = active_snapshot_path, .data = active_auth });
     try std.fs.cwd().writeFile(.{ .sub_path = backup_snapshot_path, .data = backup_auth });
+    try seedAccountUsage(gpa, home_root, "backup@example.com", 20.0, 20.0);
 
     const result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{ "remove", "active@" }, "");
     defer gpa.free(result.stdout);
@@ -1165,6 +1490,7 @@ test "Scenario: Given active account removal with missing auth json when running
     defer gpa.free(backup_auth);
     try std.fs.cwd().writeFile(.{ .sub_path = active_snapshot_path, .data = active_auth });
     try std.fs.cwd().writeFile(.{ .sub_path = backup_snapshot_path, .data = backup_auth });
+    try seedAccountUsage(gpa, home_root, "backup@example.com", 20.0, 20.0);
 
     const result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{ "remove", "active@" }, "");
     defer gpa.free(result.stdout);
@@ -1177,6 +1503,122 @@ test "Scenario: Given active account removal with missing auth json when running
     const recreated_auth = try bdd.readFileAlloc(gpa, active_auth_path);
     defer gpa.free(recreated_auth);
     try std.testing.expectEqualStrings(backup_auth, recreated_auth);
+}
+
+test "Scenario: Given active account removal with no eligible replacement when auth is manageable then remove clears the active selection and deletes auth" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "active@example.com", .alias = "" },
+        .{ .email = "exhausted@example.com", .alias = "" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+
+    const active_key = try bdd.accountKeyForEmailAlloc(gpa, "active@example.com");
+    defer gpa.free(active_key);
+    const exhausted_key = try bdd.accountKeyForEmailAlloc(gpa, "exhausted@example.com");
+    defer gpa.free(exhausted_key);
+    const active_snapshot_path = try registry.accountAuthPath(gpa, codex_home, active_key);
+    defer gpa.free(active_snapshot_path);
+    const exhausted_snapshot_path = try registry.accountAuthPath(gpa, codex_home, exhausted_key);
+    defer gpa.free(exhausted_snapshot_path);
+
+    const active_auth = try bdd.authJsonWithEmailPlan(gpa, "active@example.com", "pro");
+    defer gpa.free(active_auth);
+    const exhausted_auth = try bdd.authJsonWithEmailPlan(gpa, "exhausted@example.com", "plus");
+    defer gpa.free(exhausted_auth);
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = active_auth });
+    try std.fs.cwd().writeFile(.{ .sub_path = active_snapshot_path, .data = active_auth });
+    try std.fs.cwd().writeFile(.{ .sub_path = exhausted_snapshot_path, .data = exhausted_auth });
+    try seedAccountUsage(gpa, home_root, "active@example.com", 15.0, 15.0);
+    try seedAccountUsage(gpa, home_root, "exhausted@example.com", 100.0, 100.0);
+
+    const result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{ "remove", "active@" }, "");
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expectEqualStrings("Removed 1 account(s): active@example.com\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
+    try std.testing.expect(loaded.active_account_key == null);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().openFile(active_auth_path, .{}));
+}
+
+test "Scenario: Given active account removal with no eligible replacement when auth must be preserved then remove leaves auth in place and clears the registry active account" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "active@example.com", .alias = "" },
+        .{ .email = "exhausted@example.com", .alias = "" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+
+    const active_key = try bdd.accountKeyForEmailAlloc(gpa, "active@example.com");
+    defer gpa.free(active_key);
+    const exhausted_key = try bdd.accountKeyForEmailAlloc(gpa, "exhausted@example.com");
+    defer gpa.free(exhausted_key);
+    const active_snapshot_path = try registry.accountAuthPath(gpa, codex_home, active_key);
+    defer gpa.free(active_snapshot_path);
+    const exhausted_snapshot_path = try registry.accountAuthPath(gpa, codex_home, exhausted_key);
+    defer gpa.free(exhausted_snapshot_path);
+
+    const active_auth = try bdd.authJsonWithEmailPlan(gpa, "active@example.com", "pro");
+    defer gpa.free(active_auth);
+    const exhausted_auth = try bdd.authJsonWithEmailPlan(gpa, "exhausted@example.com", "plus");
+    defer gpa.free(exhausted_auth);
+    const malformed_auth = "{\"tokens\":";
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = malformed_auth });
+    try std.fs.cwd().writeFile(.{ .sub_path = active_snapshot_path, .data = active_auth });
+    try std.fs.cwd().writeFile(.{ .sub_path = exhausted_snapshot_path, .data = exhausted_auth });
+    try seedAccountUsage(gpa, home_root, "active@example.com", 15.0, 15.0);
+    try seedAccountUsage(gpa, home_root, "exhausted@example.com", 100.0, 100.0);
+
+    const result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{ "remove", "active@" }, "");
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expectEqualStrings("Removed 1 account(s): active@example.com\n", result.stdout);
+    try std.testing.expectEqualStrings("warning: auth.json sync skipped: UnexpectedEndOfInput\n", result.stderr);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
+    try std.testing.expect(loaded.active_account_key == null);
+
+    const preserved_auth = try bdd.readFileAlloc(gpa, active_auth_path);
+    defer gpa.free(preserved_auth);
+    try std.testing.expectEqualStrings(malformed_auth, preserved_auth);
 }
 
 test "Scenario: Given missing auth json and no valid active key when running remove then replacement auth is recreated" {
@@ -1216,6 +1658,7 @@ test "Scenario: Given missing auth json and no valid active key when running rem
     defer gpa.free(backup_auth);
     try std.fs.cwd().writeFile(.{ .sub_path = active_snapshot_path, .data = active_auth });
     try std.fs.cwd().writeFile(.{ .sub_path = backup_snapshot_path, .data = backup_auth });
+    try seedAccountUsage(gpa, home_root, "backup@example.com", 20.0, 20.0);
 
     var reg = try registry.loadRegistry(gpa, codex_home);
     defer reg.deinit(gpa);
@@ -1283,6 +1726,7 @@ test "Scenario: Given auth json already points at another registry account when 
     try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = beta_auth });
     try std.fs.cwd().writeFile(.{ .sub_path = alpha_snapshot_path, .data = alpha_auth });
     try std.fs.cwd().writeFile(.{ .sub_path = beta_snapshot_path, .data = beta_auth });
+    try seedAccountUsage(gpa, home_root, "alpha@example.com", 20.0, 20.0);
 
     const remove_result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{ "remove", "beta@" }, "");
     defer gpa.free(remove_result.stdout);
@@ -1769,8 +2213,7 @@ test "Scenario: Given unsynced active auth when removing the active registry acc
     var loaded = try registry.loadRegistry(gpa, codex_home);
     defer loaded.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
-    try std.testing.expect(loaded.active_account_key != null);
-    try std.testing.expect(std.mem.eql(u8, loaded.active_account_key.?, backup_key));
+    try std.testing.expect(loaded.active_account_key == null);
 }
 
 test "Scenario: Given parseable auth without email for the active account when removing it then auth json is preserved" {
@@ -1829,8 +2272,7 @@ test "Scenario: Given parseable auth without email for the active account when r
     var loaded = try registry.loadRegistry(gpa, codex_home);
     defer loaded.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
-    try std.testing.expect(loaded.active_account_key != null);
-    try std.testing.expect(std.mem.eql(u8, loaded.active_account_key.?, backup_key));
+    try std.testing.expect(loaded.active_account_key == null);
 }
 
 test "Scenario: Given default api usage when rendering status then no warning is printed" {
@@ -1852,8 +2294,419 @@ test "Scenario: Given default api usage when rendering status then no warning is
     try expectSuccess(result);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "auto-switch: OFF") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "usage: api") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "account: api") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "account API: api") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "active auth: missing") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "active account: none") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "active account key: none") != null);
     try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "Scenario: Given a switched account when rendering status then it shows the ready active auth and active email" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+
+    try seedRegistryWithAccounts(gpa, home_root, "one@example.com", &[_]SeedAccount{
+        .{ .email = "one@example.com", .alias = "one" },
+        .{ .email = "two@example.com", .alias = "two" },
+    });
+    try writeSeedAccountSnapshot(gpa, home_root, "one@example.com", "pro");
+    try writeSeedAccountSnapshot(gpa, home_root, "two@example.com", "pro");
+    const expected_account_key = try bdd.accountKeyForEmailAlloc(gpa, "two@example.com");
+    defer gpa.free(expected_account_key);
+
+    const switch_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "switch", "two@example.com" });
+    defer gpa.free(switch_result.stdout);
+    defer gpa.free(switch_result.stderr);
+    try expectSuccess(switch_result);
+
+    const result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{"status"});
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "active auth: ready") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "active account: two@example.com") != null);
+    const expected_key_line = try std.fmt.allocPrint(gpa, "active account key: {s}", .{expected_account_key});
+    defer gpa.free(expected_key_line);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, expected_key_line) != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "registry active:") == null);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "Scenario: Given ambiguous fuzzy selectors when running switch with account key then it activates the exact tracked account" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+
+    try seedRegistryWithAccounts(gpa, home_root, "alpha@example.com", &[_]SeedAccount{
+        .{ .email = "alpha@example.com", .alias = "team-alpha" },
+        .{ .email = "alpha-backup@example.com", .alias = "team-alpha-backup" },
+    });
+    try writeSeedAccountSnapshot(gpa, home_root, "alpha@example.com", "pro");
+    try writeSeedAccountSnapshot(gpa, home_root, "alpha-backup@example.com", "pro");
+
+    const target_account_key = try bdd.accountKeyForEmailAlloc(gpa, "alpha-backup@example.com");
+    defer gpa.free(target_account_key);
+
+    const switch_result = try runCliWithIsolatedHome(
+        gpa,
+        project_root,
+        home_root,
+        &[_][]const u8{ "switch", "--account-key", target_account_key },
+    );
+    defer gpa.free(switch_result.stdout);
+    defer gpa.free(switch_result.stderr);
+    try expectSuccess(switch_result);
+
+    const status_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{"status"});
+    defer gpa.free(status_result.stdout);
+    defer gpa.free(status_result.stderr);
+
+    try expectSuccess(status_result);
+    try std.testing.expect(std.mem.indexOf(u8, status_result.stdout, "active account: alpha-backup@example.com") != null);
+    const expected_key_line = try std.fmt.allocPrint(gpa, "active account key: {s}", .{target_account_key});
+    defer gpa.free(expected_key_line);
+    try std.testing.expect(std.mem.indexOf(u8, status_result.stdout, expected_key_line) != null);
+}
+
+test "Scenario: Given switch best chooses the already-active registry account with missing auth when running then it restores the active auth snapshot" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+
+    try seedRegistryWithAccounts(gpa, home_root, "best@example.com", &[_]SeedAccount{
+        .{ .email = "best@example.com", .alias = "best" },
+        .{ .email = "other@example.com", .alias = "other" },
+    });
+    try writeSeedAccountSnapshot(gpa, home_root, "best@example.com", "pro");
+    try writeSeedAccountSnapshot(gpa, home_root, "other@example.com", "pro");
+    try seedAccountUsage(gpa, home_root, "best@example.com", 15.0, 10.0);
+    try seedAccountUsage(gpa, home_root, "other@example.com", 80.0, 20.0);
+
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+    try std.testing.expect(!(try pathExists(active_auth_path)));
+
+    const switch_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "switch", "--best" });
+    defer gpa.free(switch_result.stdout);
+    defer gpa.free(switch_result.stderr);
+    try expectSuccess(switch_result);
+    try std.testing.expect(try pathExists(active_auth_path));
+
+    const status_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{"status"});
+    defer gpa.free(status_result.stdout);
+    defer gpa.free(status_result.stderr);
+
+    try expectSuccess(status_result);
+    try std.testing.expect(std.mem.indexOf(u8, status_result.stdout, "active auth: ready") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_result.stdout, "active account: best@example.com") != null);
+}
+
+test "Scenario: Given switch query selects the already-active registry account with malformed auth when running then it restores the active auth snapshot" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+
+    try seedRegistryWithAccounts(gpa, home_root, "two@example.com", &[_]SeedAccount{
+        .{ .email = "one@example.com", .alias = "one" },
+        .{ .email = "two@example.com", .alias = "two" },
+    });
+    try writeSeedAccountSnapshot(gpa, home_root, "one@example.com", "pro");
+    try writeSeedAccountSnapshot(gpa, home_root, "two@example.com", "pro");
+
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = active_auth_path, .data = "{" });
+
+    const switch_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "switch", "two@example.com" });
+    defer gpa.free(switch_result.stdout);
+    defer gpa.free(switch_result.stderr);
+    try expectSuccess(switch_result);
+
+    const status_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{"status"});
+    defer gpa.free(status_result.stdout);
+    defer gpa.free(status_result.stderr);
+
+    try expectSuccess(status_result);
+    try std.testing.expect(std.mem.indexOf(u8, status_result.stdout, "active auth: ready") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_result.stdout, "active account: two@example.com") != null);
+}
+
+test "Scenario: Given accounts with different fresh known quota when running switch best then it activates the highest known account" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+
+    try seedRegistryWithAccounts(gpa, home_root, "low@example.com", &[_]SeedAccount{
+        .{ .email = "low@example.com", .alias = "low" },
+        .{ .email = "high@example.com", .alias = "high" },
+    });
+    try writeSeedAccountSnapshot(gpa, home_root, "low@example.com", "pro");
+    try writeSeedAccountSnapshot(gpa, home_root, "high@example.com", "pro");
+    try seedAccountUsage(gpa, home_root, "low@example.com", 80.0, 20.0);
+    try seedAccountUsage(gpa, home_root, "high@example.com", 15.0, 10.0);
+
+    const switch_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "switch", "--best" });
+    defer gpa.free(switch_result.stdout);
+    defer gpa.free(switch_result.stderr);
+    try expectSuccess(switch_result);
+
+    const result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{"status"});
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "active account: high@example.com") != null);
+}
+
+test "Scenario: Given one account has stronger 5h headroom but weaker weekly headroom when running switch best then it follows the proactive ranking model" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+
+    try seedRegistryWithAccounts(gpa, home_root, "minscore@example.com", &[_]SeedAccount{
+        .{ .email = "minscore@example.com", .alias = "min" },
+        .{ .email = "fivehour@example.com", .alias = "fiveh" },
+    });
+    try writeSeedAccountSnapshot(gpa, home_root, "minscore@example.com", "pro");
+    try writeSeedAccountSnapshot(gpa, home_root, "fivehour@example.com", "pro");
+    try seedAccountUsage(gpa, home_root, "minscore@example.com", 40.0, 10.0);
+    try seedAccountUsage(gpa, home_root, "fivehour@example.com", 10.0, 80.0);
+
+    const switch_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "switch", "--best" });
+    defer gpa.free(switch_result.stdout);
+    defer gpa.free(switch_result.stderr);
+    try expectSuccess(switch_result);
+
+    const status_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{"status"});
+    defer gpa.free(status_result.stdout);
+    defer gpa.free(status_result.stderr);
+
+    try expectSuccess(status_result);
+    try std.testing.expect(std.mem.indexOf(u8, status_result.stdout, "active account: fivehour@example.com") != null);
+}
+
+test "Scenario: Given a higher raw snapshot is below threshold when running switch best then it still chooses the highest fresh known quota account" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+
+    try seedRegistryWithAccounts(gpa, home_root, "exhausted@example.com", &[_]SeedAccount{
+        .{ .email = "exhausted@example.com", .alias = "exhausted" },
+        .{ .email = "healthy@example.com", .alias = "healthy" },
+    });
+    try writeSeedAccountSnapshot(gpa, home_root, "exhausted@example.com", "pro");
+    try writeSeedAccountSnapshot(gpa, home_root, "healthy@example.com", "pro");
+    try seedAccountUsage(gpa, home_root, "exhausted@example.com", 0.0, 100.0);
+    try seedAccountUsage(gpa, home_root, "healthy@example.com", 58.0, 58.0);
+
+    const switch_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "switch", "--best" });
+    defer gpa.free(switch_result.stdout);
+    defer gpa.free(switch_result.stderr);
+    try expectSuccess(switch_result);
+
+    const status_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{"status"});
+    defer gpa.free(status_result.stdout);
+    defer gpa.free(status_result.stderr);
+
+    try expectSuccess(status_result);
+    try std.testing.expect(std.mem.indexOf(u8, status_result.stdout, "active account: exhausted@example.com") != null);
+}
+
+test "Scenario: Given no fresh known quota when running switch best then it exits with a clear error" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+
+    try seedRegistryWithAccounts(gpa, home_root, "one@example.com", &[_]SeedAccount{
+        .{ .email = "one@example.com", .alias = "one" },
+        .{ .email = "two@example.com", .alias = "two" },
+    });
+    try writeSeedAccountSnapshot(gpa, home_root, "one@example.com", "pro");
+    try writeSeedAccountSnapshot(gpa, home_root, "two@example.com", "pro");
+
+    const result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "switch", "--best" });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "fresh known quota snapshot") != null);
+}
+
+test "Scenario: Given proactive auto mode when configuring then status shows proactive selection" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+
+    const config_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "config", "auto", "mode", "proactive" });
+    defer gpa.free(config_result.stdout);
+    defer gpa.free(config_result.stderr);
+    try expectSuccess(config_result);
+    try std.testing.expect(std.mem.indexOf(u8, config_result.stdout, "selection: proactive-best-snapshot") != null);
+
+    const status_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{"status"});
+    defer gpa.free(status_result.stdout);
+    defer gpa.free(status_result.stderr);
+    try expectSuccess(status_result);
+    try std.testing.expect(std.mem.indexOf(u8, status_result.stdout, "selection: proactive-best-snapshot") != null);
+}
+
+test "Scenario: Given pinned auto mode when configuring then status shows pinned selection and pin state" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+    try seedRegistryWithAccounts(gpa, home_root, "pinned@example.com", &[_]SeedAccount{
+        .{ .email = "pinned@example.com", .alias = "pin" },
+    });
+    try writeSeedAccountSnapshot(gpa, home_root, "pinned@example.com", "pro");
+    try seedAccountUsage(gpa, home_root, "pinned@example.com", 15.0, 10.0);
+
+    const mode_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "config", "auto", "mode", "pinned" });
+    defer gpa.free(mode_result.stdout);
+    defer gpa.free(mode_result.stderr);
+    try expectSuccess(mode_result);
+
+    const switch_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "switch", "--best" });
+    defer gpa.free(switch_result.stdout);
+    defer gpa.free(switch_result.stderr);
+    try expectSuccess(switch_result);
+
+    const status_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{"status"});
+    defer gpa.free(status_result.stdout);
+    defer gpa.free(status_result.stderr);
+    try expectSuccess(status_result);
+    try std.testing.expect(std.mem.indexOf(u8, status_result.stdout, "selection: pinned-best-known") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_result.stdout, "pinned account: pinned@example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_result.stdout, "pin state: ready") != null);
+}
+
+test "Scenario: Given pinned mode is left and then re-entered when no new switch occurs then the old pin does not come back" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+    try seedRegistryWithAccounts(gpa, home_root, "pinned@example.com", &[_]SeedAccount{
+        .{ .email = "pinned@example.com", .alias = "pin" },
+    });
+    try writeSeedAccountSnapshot(gpa, home_root, "pinned@example.com", "pro");
+    try seedAccountUsage(gpa, home_root, "pinned@example.com", 15.0, 10.0);
+
+    const mode_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "config", "auto", "mode", "pinned" });
+    defer gpa.free(mode_result.stdout);
+    defer gpa.free(mode_result.stderr);
+    try expectSuccess(mode_result);
+
+    const switch_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "switch", "--best" });
+    defer gpa.free(switch_result.stdout);
+    defer gpa.free(switch_result.stderr);
+    try expectSuccess(switch_result);
+
+    const reactive_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "config", "auto", "mode", "reactive" });
+    defer gpa.free(reactive_result.stdout);
+    defer gpa.free(reactive_result.stderr);
+    try expectSuccess(reactive_result);
+
+    const reenter_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "config", "auto", "mode", "pinned" });
+    defer gpa.free(reenter_result.stdout);
+    defer gpa.free(reenter_result.stderr);
+    try expectSuccess(reenter_result);
+
+    const status_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{"status"});
+    defer gpa.free(status_result.stdout);
+    defer gpa.free(status_result.stderr);
+    try expectSuccess(status_result);
+    try std.testing.expect(std.mem.indexOf(u8, status_result.stdout, "selection: pinned-best-known") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_result.stdout, "pinned account: none") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_result.stdout, "pin state: none") != null);
 }
 
 test "Scenario: Given default api usage when listing accounts then no warning is printed" {

@@ -490,3 +490,137 @@ test "scan latest usage skips oversized malformed lines and keeps later valid ev
     try std.testing.expect(latest.snapshot.primary != null);
     try std.testing.expectEqual(@as(f64, 64.0), latest.snapshot.primary.?.used_percent);
 }
+
+test "scan latest usage runtime cache reuses the cached newest rollout between bounded rescans" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const codex_home = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(codex_home);
+    try tmp.dir.makePath("sessions/2025/01/01");
+
+    const first_line = try usageLineAlloc(gpa, "2025-01-01T00:00:17.000Z", 21.0);
+    defer gpa.free(first_line);
+    const second_line = try usageLineAlloc(gpa, "2025-01-01T00:00:18.000Z", 9.0);
+    defer gpa.free(second_line);
+    const first_path = try std.fs.path.join(gpa, &[_][]const u8{ codex_home, "sessions", "2025", "01", "01", "rollout-a.jsonl" });
+    defer gpa.free(first_path);
+    const second_path = try std.fs.path.join(gpa, &[_][]const u8{ codex_home, "sessions", "2025", "01", "01", "rollout-b.jsonl" });
+    defer gpa.free(second_path);
+
+    try tmp.dir.writeFile(.{ .sub_path = "sessions/2025/01/01/rollout-a.jsonl", .data = first_line });
+    const base_time = std.time.nanoTimestamp();
+    try updateFileTimes(first_path, base_time, base_time);
+
+    var latest = (try sessions.scanLatestUsageWithRuntimeCache(gpa, codex_home)) orelse return error.TestExpectedEqual;
+    defer latest.deinit(gpa);
+    try std.testing.expectEqualStrings("rollout-a.jsonl", std.fs.path.basename(latest.path));
+
+    try tmp.dir.writeFile(.{ .sub_path = "sessions/2025/01/01/rollout-b.jsonl", .data = second_line });
+    try updateFileTimes(second_path, base_time + std.time.ns_per_s, base_time + std.time.ns_per_s);
+
+    latest.deinit(gpa);
+    latest = (try sessions.scanLatestUsageWithRuntimeCache(gpa, codex_home)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("rollout-a.jsonl", std.fs.path.basename(latest.path));
+}
+
+test "scan latest usage runtime cache reuses the cached newest usable snapshot when the newest event is unusable" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const codex_home = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(codex_home);
+    try tmp.dir.makePath("sessions/2025/01/01");
+
+    const unusable_rollout =
+        "{\"timestamp\":\"2025-01-01T00:00:17.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"rate_limits\":{\"primary\":{\"used_percent\":21.0,\"window_minutes\":300,\"resets_at\":123},\"secondary\":{\"used_percent\":9.0,\"window_minutes\":10080,\"resets_at\":456},\"plan_type\":\"pro\"}}}\n" ++
+        "{\"timestamp\":\"2025-01-01T00:00:18.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"rate_limits\":null}}\n";
+    const changed_rollout = try usageLineAlloc(gpa, "2025-01-01T00:00:19.000Z", 4.0);
+    defer gpa.free(changed_rollout);
+    const rollout_path = try std.fs.path.join(gpa, &[_][]const u8{ codex_home, "sessions", "2025", "01", "01", "rollout-a.jsonl" });
+    defer gpa.free(rollout_path);
+
+    try tmp.dir.writeFile(.{ .sub_path = "sessions/2025/01/01/rollout-a.jsonl", .data = unusable_rollout });
+    const base_time = std.time.nanoTimestamp();
+    try updateFileTimes(rollout_path, base_time, base_time);
+
+    var latest = (try sessions.scanLatestUsageWithRuntimeCache(gpa, codex_home)) orelse return error.TestExpectedEqual;
+    defer latest.deinit(gpa);
+    try std.testing.expectEqual(@as(i64, 1735689617000), latest.event_timestamp_ms);
+    try std.testing.expectEqual(@as(f64, 21.0), latest.snapshot.primary.?.used_percent);
+
+    try tmp.dir.writeFile(.{ .sub_path = "sessions/2025/01/01/rollout-a.jsonl", .data = changed_rollout });
+    try updateFileTimes(rollout_path, base_time, base_time);
+
+    latest.deinit(gpa);
+    latest = (try sessions.scanLatestUsageWithRuntimeCache(gpa, codex_home)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(i64, 1735689617000), latest.event_timestamp_ms);
+    try std.testing.expectEqual(@as(f64, 21.0), latest.snapshot.primary.?.used_percent);
+}
+
+test "scan latest usage runtime cache stays compact and reusable for large credit balances" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const codex_home = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(codex_home);
+    try tmp.dir.makePath("sessions/2025/01/01");
+
+    const first_line = try usageLineWithLargeBalanceAlloc(gpa, "2025-01-01T00:00:20.000Z", 33.0, 2 * 1024 * 1024);
+    defer gpa.free(first_line);
+    const second_line = try usageLineAlloc(gpa, "2025-01-01T00:00:21.000Z", 4.0);
+    defer gpa.free(second_line);
+
+    const first_path = try std.fs.path.join(gpa, &[_][]const u8{ codex_home, "sessions", "2025", "01", "01", "rollout-large-a.jsonl" });
+    defer gpa.free(first_path);
+    const second_path = try std.fs.path.join(gpa, &[_][]const u8{ codex_home, "sessions", "2025", "01", "01", "rollout-b.jsonl" });
+    defer gpa.free(second_path);
+    const cache_path = try std.fs.path.join(gpa, &[_][]const u8{ codex_home, "runtime", "latest-rollout.json" });
+    defer gpa.free(cache_path);
+
+    try tmp.dir.writeFile(.{ .sub_path = "sessions/2025/01/01/rollout-large-a.jsonl", .data = first_line });
+    const base_time = std.time.nanoTimestamp();
+    try updateFileTimes(first_path, base_time, base_time);
+
+    var latest = (try sessions.scanLatestUsageWithRuntimeCache(gpa, codex_home)) orelse return error.TestExpectedEqual;
+    defer latest.deinit(gpa);
+    try std.testing.expectEqualStrings("rollout-large-a.jsonl", std.fs.path.basename(latest.path));
+
+    const cache_stat = try std.fs.cwd().statFile(cache_path);
+    try std.testing.expect(cache_stat.size < 128 * 1024);
+
+    const cache_data = try std.fs.cwd().readFileAlloc(gpa, cache_path, 128 * 1024);
+    defer gpa.free(cache_data);
+    try std.testing.expect(std.mem.indexOf(u8, cache_data, "\"balance\"") == null);
+
+    try tmp.dir.writeFile(.{ .sub_path = "sessions/2025/01/01/rollout-b.jsonl", .data = second_line });
+    try updateFileTimes(second_path, base_time + std.time.ns_per_s, base_time + std.time.ns_per_s);
+
+    latest.deinit(gpa);
+    latest = (try sessions.scanLatestUsageWithRuntimeCache(gpa, codex_home)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("rollout-large-a.jsonl", std.fs.path.basename(latest.path));
+}
+
+test "scan latest usage runtime cache ignores malformed cache files and falls back to a full scan" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const codex_home = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(codex_home);
+    try tmp.dir.makePath("sessions/2025/01/01");
+    try tmp.dir.makePath("runtime");
+
+    const valid_line = try usageLineAlloc(gpa, "2025-01-01T00:00:19.000Z", 17.0);
+    defer gpa.free(valid_line);
+    try tmp.dir.writeFile(.{ .sub_path = "sessions/2025/01/01/rollout-a.jsonl", .data = valid_line });
+    try tmp.dir.writeFile(.{ .sub_path = "runtime/latest-rollout.json", .data = "{not-json" });
+
+    var latest = (try sessions.scanLatestUsageWithRuntimeCache(gpa, codex_home)) orelse return error.TestExpectedEqual;
+    defer latest.deinit(gpa);
+    try std.testing.expectEqualStrings("rollout-a.jsonl", std.fs.path.basename(latest.path));
+    try std.testing.expectEqual(@as(i64, 1735689619000), latest.event_timestamp_ms);
+}

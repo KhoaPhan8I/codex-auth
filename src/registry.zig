@@ -11,7 +11,10 @@ pub const current_schema_version: u32 = 3;
 pub const min_supported_schema_version: u32 = 2;
 pub const default_auto_switch_threshold_5h_percent: u8 = 10;
 pub const default_auto_switch_threshold_weekly_percent: u8 = 5;
+pub const local_snapshot_max_age_seconds: i64 = 24 * 60 * 60;
 pub const account_name_refresh_lock_file_name = "account-name-refresh.lock";
+pub const AutoSwitchMode = enum { reactive, proactive, pinned, failover };
+pub const FailoverState = enum { idle, processing, switched, no_target, stale_event, @"error" };
 
 fn normalizeEmailAlloc(allocator: std.mem.Allocator, email: []const u8) ![]u8 {
     var buf = try allocator.alloc(u8, email.len);
@@ -40,6 +43,23 @@ pub const RateLimitSnapshot = struct {
     plan_type: ?PlanType,
 };
 
+pub const SnapshotFreshness = enum {
+    unknown,
+    stale,
+    fresh,
+};
+
+pub const AccountAuthHealth = enum {
+    unknown,
+    valid,
+    verified,
+    missing_auth,
+    malformed_auth,
+    account_mismatch,
+    api_failed,
+    quarantined,
+};
+
 pub const RolloutSignature = struct {
     path: []u8,
     event_timestamp_ms: i64,
@@ -47,6 +67,11 @@ pub const RolloutSignature = struct {
 
 pub const AutoSwitchConfig = struct {
     enabled: bool = false,
+    mode: AutoSwitchMode = .reactive,
+    pinned_account_key: ?[]u8 = null,
+    failover_state: FailoverState = .idle,
+    blocked_account_key: ?[]u8 = null,
+    blocked_until_ms: ?i64 = null,
     threshold_5h_percent: u8 = default_auto_switch_threshold_5h_percent,
     threshold_weekly_percent: u8 = default_auto_switch_threshold_weekly_percent,
 };
@@ -76,6 +101,11 @@ pub const AccountRecord = struct {
     last_usage: ?RateLimitSnapshot,
     last_usage_at: ?i64,
     last_local_rollout: ?RolloutSignature,
+    auth_health: AccountAuthHealth = .unknown,
+    auth_checked_at: ?i64 = null,
+    auth_verified_at: ?i64 = null,
+    auth_error: ?[]u8 = null,
+    auth_quarantined_at: ?i64 = null,
 };
 
 pub fn resolvePlan(rec: *const AccountRecord) ?PlanType {
@@ -97,6 +127,8 @@ pub const Registry = struct {
             freeAccountRecord(allocator, rec);
         }
         if (self.active_account_key) |k| allocator.free(k);
+        if (self.auto_switch.pinned_account_key) |k| allocator.free(k);
+        if (self.auto_switch.blocked_account_key) |k| allocator.free(k);
         self.accounts.deinit(allocator);
     }
 };
@@ -116,6 +148,7 @@ fn freeAccountRecord(allocator: std.mem.Allocator, rec: *const AccountRecord) vo
     allocator.free(rec.email);
     allocator.free(rec.alias);
     if (rec.account_name) |account_name| allocator.free(account_name);
+    if (rec.auth_error) |auth_error| allocator.free(auth_error);
     if (rec.last_local_rollout) |*sig| freeRolloutSignature(allocator, sig);
     if (rec.last_usage) |*u| {
         freeRateLimitSnapshot(allocator, u);
@@ -207,10 +240,23 @@ pub fn rateLimitSnapshotsEqual(a: ?RateLimitSnapshot, b: ?RateLimitSnapshot) boo
     return rateLimitSnapshotEqual(a.?, b.?);
 }
 
+pub fn rateLimitSnapshotsEqualIgnoringCreditBalance(a: ?RateLimitSnapshot, b: ?RateLimitSnapshot) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return rateLimitSnapshotEqualIgnoringCreditBalance(a.?, b.?);
+}
+
 pub fn rateLimitSnapshotEqual(a: RateLimitSnapshot, b: RateLimitSnapshot) bool {
     return rateLimitWindowEqual(a.primary, b.primary) and
         rateLimitWindowEqual(a.secondary, b.secondary) and
         creditsEqual(a.credits, b.credits) and
+        a.plan_type == b.plan_type;
+}
+
+pub fn rateLimitSnapshotEqualIgnoringCreditBalance(a: RateLimitSnapshot, b: RateLimitSnapshot) bool {
+    return rateLimitWindowEqual(a.primary, b.primary) and
+        rateLimitWindowEqual(a.secondary, b.secondary) and
+        creditsEqualIgnoringBalance(a.credits, b.credits) and
         a.plan_type == b.plan_type;
 }
 
@@ -228,6 +274,28 @@ fn creditsEqual(a: ?CreditsSnapshot, b: ?CreditsSnapshot) bool {
     return a.?.has_credits == b.?.has_credits and
         a.?.unlimited == b.?.unlimited and
         optionalStringEqual(a.?.balance, b.?.balance);
+}
+
+fn creditsEqualIgnoringBalance(a: ?CreditsSnapshot, b: ?CreditsSnapshot) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return a.?.has_credits == b.?.has_credits and
+        a.?.unlimited == b.?.unlimited;
+}
+
+pub fn preserveCreditBalanceIfMissing(
+    allocator: std.mem.Allocator,
+    existing: ?RateLimitSnapshot,
+    snapshot: *RateLimitSnapshot,
+) !void {
+    const incoming = snapshot.credits orelse return;
+    if (incoming.balance != null) return;
+    const previous = if (existing) |resolved| resolved.credits else null;
+    if (previous == null) return;
+    if (!creditsEqualIgnoringBalance(snapshot.credits, previous)) return;
+    if (previous.?.balance) |balance| {
+        snapshot.credits.?.balance = try allocator.dupe(u8, balance);
+    }
 }
 
 fn optionalStringEqual(a: ?[]const u8, b: ?[]const u8) bool {
@@ -546,7 +614,9 @@ fn isAllowedCurrentSnapshot(reg: *const Registry, entry_name: []const u8) bool {
     for (reg.accounts.items) |rec| {
         const expected_name = accountSnapshotFileName(std.heap.page_allocator, rec.account_key) catch continue;
         defer std.heap.page_allocator.free(expected_name);
-        if (std.mem.eql(u8, entry_name, expected_name)) {
+        if (std.mem.eql(u8, entry_name, expected_name) or
+            (std.mem.startsWith(u8, entry_name, expected_name) and std.mem.containsAtLeast(u8, entry_name, 1, ".bak.")))
+        {
             return true;
         }
     }
@@ -624,21 +694,88 @@ pub fn backupAuthIfChanged(
     current_auth_path: []const u8,
     new_auth_path: []const u8,
 ) !void {
+    try backupFileIfChanged(allocator, codex_home, current_auth_path, new_auth_path, "auth.json");
+}
+
+fn backupFileIfChanged(
+    allocator: std.mem.Allocator,
+    codex_home: []const u8,
+    current_path: []const u8,
+    new_path: []const u8,
+    backup_base_name: []const u8,
+) !void {
     const dir = try backupDir(allocator, codex_home);
     defer allocator.free(dir);
     try ensureDir(dir);
 
-    if (!(try filesEqual(allocator, current_auth_path, new_auth_path))) {
-        if (std.fs.cwd().openFile(current_auth_path, .{})) |file| {
+    if (!(try filesEqual(allocator, current_path, new_path))) {
+        if (std.fs.cwd().openFile(current_path, .{})) |file| {
             file.close();
         } else |_| {
             return;
         }
-        const backup = try makeBackupPath(allocator, dir, "auth.json");
+        const backup = try makeBackupPath(allocator, dir, backup_base_name);
         defer allocator.free(backup);
-        try std.fs.cwd().copyFile(current_auth_path, std.fs.cwd(), backup, .{});
-        try pruneBackups(allocator, dir, "auth.json", max_backups);
+        try std.fs.cwd().copyFile(current_path, std.fs.cwd(), backup, .{});
+        try pruneBackups(allocator, dir, backup_base_name, max_backups);
     }
+}
+
+fn backupFileIfChangedBytes(
+    allocator: std.mem.Allocator,
+    codex_home: []const u8,
+    current_path: []const u8,
+    new_bytes: []const u8,
+    backup_base_name: []const u8,
+) !void {
+    const dir = try backupDir(allocator, codex_home);
+    defer allocator.free(dir);
+    try ensureDir(dir);
+
+    if (try fileEqualsBytes(allocator, current_path, new_bytes)) {
+        return;
+    }
+
+    if (std.fs.cwd().openFile(current_path, .{})) |file| {
+        file.close();
+    } else |_| {
+        return;
+    }
+
+    const backup = try makeBackupPath(allocator, dir, backup_base_name);
+    defer allocator.free(backup);
+    try std.fs.cwd().copyFile(current_path, std.fs.cwd(), backup, .{});
+    try pruneBackups(allocator, dir, backup_base_name, max_backups);
+}
+
+fn backupAccountSnapshotBeforeCopy(
+    allocator: std.mem.Allocator,
+    codex_home: []const u8,
+    current_snapshot_path: []const u8,
+    incoming_auth_path: []const u8,
+) !void {
+    try backupFileIfChanged(
+        allocator,
+        codex_home,
+        current_snapshot_path,
+        incoming_auth_path,
+        std.fs.path.basename(current_snapshot_path),
+    );
+}
+
+fn backupAccountSnapshotBeforeWrite(
+    allocator: std.mem.Allocator,
+    codex_home: []const u8,
+    current_snapshot_path: []const u8,
+    incoming_auth_bytes: []const u8,
+) !void {
+    try backupFileIfChangedBytes(
+        allocator,
+        codex_home,
+        current_snapshot_path,
+        incoming_auth_bytes,
+        std.fs.path.basename(current_snapshot_path),
+    );
 }
 
 fn backupRegistryIfChanged(
@@ -1106,6 +1243,7 @@ fn importConvertedAuthInfo(
     defer allocator.free(dest);
 
     try ensureAccountsDir(allocator, codex_home);
+    try backupAccountSnapshotBeforeWrite(allocator, codex_home, dest, auth_data);
     try writeFile(dest, auth_data);
 
     const record = try accountFromAuth(allocator, alias, info);
@@ -1143,6 +1281,7 @@ fn importAuthInfo(
     defer allocator.free(dest);
 
     try ensureAccountsDir(allocator, codex_home);
+    try backupAccountSnapshotBeforeCopy(allocator, codex_home, dest, auth_file);
     try copyFile(auth_file, dest);
 
     const record = try accountFromAuth(allocator, alias, info);
@@ -1471,6 +1610,7 @@ fn syncCurrentAuthBestEffort(
     const dest = try accountAuthPath(allocator, codex_home, record_key);
     defer allocator.free(dest);
     try ensureAccountsDir(allocator, codex_home);
+    try backupAccountSnapshotBeforeCopy(allocator, codex_home, dest, auth_path);
     try copyFile(auth_path, dest);
 
     if (existing_idx) |idx| {
@@ -1496,6 +1636,7 @@ fn syncCurrentAuthBestEffort(
         }
         reg.accounts.items[idx].plan = info.plan;
         reg.accounts.items[idx].auth_mode = info.auth_mode;
+        try markAccountAuthValid(allocator, reg, record_key);
     } else {
         var record = try accountFromAuth(allocator, "", &info);
         errdefer freeAccountRecord(allocator, &record);
@@ -1530,6 +1671,49 @@ pub fn setActiveAccountKey(allocator: std.mem.Allocator, reg: *Registry, account
             break;
         }
     }
+}
+
+pub fn setPinnedAccountKey(allocator: std.mem.Allocator, reg: *Registry, account_key: ?[]const u8) !void {
+    if (account_key) |key| {
+        if (reg.auto_switch.pinned_account_key) |existing| {
+            if (std.mem.eql(u8, existing, key)) return;
+        }
+        const owned = try allocator.dupe(u8, key);
+        if (reg.auto_switch.pinned_account_key) |existing| {
+            allocator.free(existing);
+        }
+        reg.auto_switch.pinned_account_key = owned;
+        return;
+    }
+    if (reg.auto_switch.pinned_account_key) |existing| {
+        allocator.free(existing);
+    }
+    reg.auto_switch.pinned_account_key = null;
+}
+
+pub fn setBlockedAccount(
+    allocator: std.mem.Allocator,
+    reg: *Registry,
+    account_key: ?[]const u8,
+    blocked_until_ms: ?i64,
+) !void {
+    if (account_key) |key| {
+        if (reg.auto_switch.blocked_account_key) |existing| {
+            if (std.mem.eql(u8, existing, key) and reg.auto_switch.blocked_until_ms == blocked_until_ms) return;
+        }
+        const owned = try allocator.dupe(u8, key);
+        if (reg.auto_switch.blocked_account_key) |existing| {
+            allocator.free(existing);
+        }
+        reg.auto_switch.blocked_account_key = owned;
+        reg.auto_switch.blocked_until_ms = blocked_until_ms;
+        return;
+    }
+    if (reg.auto_switch.blocked_account_key) |existing| {
+        allocator.free(existing);
+    }
+    reg.auto_switch.blocked_account_key = null;
+    reg.auto_switch.blocked_until_ms = null;
 }
 
 pub fn updateUsage(allocator: std.mem.Allocator, reg: *Registry, account_key: []const u8, snapshot: RateLimitSnapshot) void {
@@ -1585,6 +1769,7 @@ pub fn syncActiveAccountFromAuth(allocator: std.mem.Allocator, codex_home: []con
         defer allocator.free(dest);
 
         try ensureAccountsDir(allocator, codex_home);
+        try backupAccountSnapshotBeforeCopy(allocator, codex_home, dest, auth_path);
         try copyFile(auth_path, dest);
 
         var record = try accountFromAuth(allocator, "", &info);
@@ -1623,7 +1808,12 @@ pub fn syncActiveAccountFromAuth(allocator: std.mem.Allocator, codex_home: []con
     const dest = try accountAuthPath(allocator, codex_home, rec_account_key);
     defer allocator.free(dest);
     if (!(try fileEqualsBytes(allocator, dest, auth_bytes))) {
+        try backupAccountSnapshotBeforeCopy(allocator, codex_home, dest, auth_path);
         try copyFile(auth_path, dest);
+        changed = true;
+    }
+    if (!accountAuthSnapshotUsable(&reg.accounts.items[idx]) or reg.accounts.items[idx].auth_health == .unknown) {
+        try markAccountAuthValid(allocator, reg, rec_account_key);
         changed = true;
     }
 
@@ -1655,6 +1845,22 @@ pub fn removeAccounts(allocator: std.mem.Allocator, codex_home: []const u8, reg:
             allocator.free(key);
             reg.active_account_key = null;
             reg.active_account_activated_at_ms = null;
+        }
+    }
+    if (reg.auto_switch.pinned_account_key) |key| {
+        for (reg.accounts.items, 0..) |rec, i| {
+            if (removed[i] and std.mem.eql(u8, rec.account_key, key)) {
+                try setPinnedAccountKey(allocator, reg, null);
+                break;
+            }
+        }
+    }
+    if (reg.auto_switch.blocked_account_key) |key| {
+        for (reg.accounts.items, 0..) |rec, i| {
+            if (removed[i] and std.mem.eql(u8, rec.account_key, key)) {
+                try setBlockedAccount(allocator, reg, null, null);
+                break;
+            }
         }
     }
 
@@ -1716,36 +1922,138 @@ fn isRemovedAccountKey(reg: *const Registry, removed: []const bool, record_key: 
     return false;
 }
 
-pub fn selectBestAccountIndexByUsage(reg: *Registry) ?usize {
-    if (reg.accounts.items.len == 0) return null;
-    const now = std.time.timestamp();
-    var best_idx: ?usize = null;
-    var best_score: i64 = -2;
-    var best_seen: i64 = -1;
-    for (reg.accounts.items, 0..) |rec, i| {
-        const score = usageScoreAt(rec.last_usage, now) orelse -1;
-        const seen = rec.last_usage_at orelse -1;
-        if (score > best_score) {
-            best_score = score;
-            best_seen = seen;
-            best_idx = i;
-        } else if (score == best_score and seen > best_seen) {
-            best_seen = seen;
-            best_idx = i;
-        }
-    }
-    return best_idx;
+pub fn snapshotFreshnessAt(last_usage: ?RateLimitSnapshot, last_usage_at: ?i64, now: i64) SnapshotFreshness {
+    if (last_usage == null or last_usage_at == null) return .unknown;
+    if (last_usage_at.? > now) return .fresh;
+    if ((now - last_usage_at.?) > local_snapshot_max_age_seconds) return .stale;
+    return .fresh;
 }
 
-pub fn usageScoreAt(usage: ?RateLimitSnapshot, now: i64) ?i64 {
-    const rate_5h = resolveRateWindow(usage, 300, true);
-    const rate_week = resolveRateWindow(usage, 10080, false);
-    const rem_5h = remainingPercentAt(rate_5h, now);
-    const rem_week = remainingPercentAt(rate_week, now);
-    if (rem_5h != null and rem_week != null) return @min(rem_5h.?, rem_week.?);
-    if (rem_5h != null) return rem_5h.?;
-    if (rem_week != null) return rem_week.?;
-    return null;
+pub fn accountSnapshotFreshness(rec: *const AccountRecord, now: i64) SnapshotFreshness {
+    return snapshotFreshnessAt(rec.last_usage, rec.last_usage_at, now);
+}
+
+fn setAccountAuthHealth(
+    allocator: std.mem.Allocator,
+    rec: *AccountRecord,
+    health: AccountAuthHealth,
+    reason: ?[]const u8,
+) !void {
+    const owned_reason = if (reason) |text| try allocator.dupe(u8, text) else null;
+    errdefer if (owned_reason) |text| allocator.free(text);
+
+    if (rec.auth_error) |existing| allocator.free(existing);
+    rec.auth_error = owned_reason;
+    rec.auth_checked_at = std.time.timestamp();
+
+    if (health == .valid and rec.auth_health == .verified) {
+        rec.auth_quarantined_at = null;
+        return;
+    }
+
+    rec.auth_health = health;
+    switch (health) {
+        .verified => {
+            rec.auth_verified_at = rec.auth_checked_at;
+            rec.auth_quarantined_at = null;
+        },
+        .valid, .unknown => {
+            rec.auth_verified_at = null;
+            rec.auth_quarantined_at = null;
+        },
+        .quarantined => {
+            rec.auth_verified_at = null;
+            rec.auth_quarantined_at = rec.auth_checked_at;
+        },
+        .missing_auth, .malformed_auth, .account_mismatch, .api_failed => {
+            rec.auth_verified_at = null;
+            rec.auth_quarantined_at = null;
+        },
+    }
+}
+
+pub fn markAccountAuthValid(
+    allocator: std.mem.Allocator,
+    reg: *Registry,
+    account_key: []const u8,
+) !void {
+    const idx = findAccountIndexByAccountKey(reg, account_key) orelse return error.AccountNotFound;
+    try setAccountAuthHealth(allocator, &reg.accounts.items[idx], .valid, null);
+}
+
+pub fn markAccountAuthVerified(
+    allocator: std.mem.Allocator,
+    reg: *Registry,
+    account_key: []const u8,
+) !void {
+    const idx = findAccountIndexByAccountKey(reg, account_key) orelse return error.AccountNotFound;
+    try setAccountAuthHealth(allocator, &reg.accounts.items[idx], .verified, null);
+}
+
+pub fn markAccountAuthFailure(
+    allocator: std.mem.Allocator,
+    reg: *Registry,
+    account_key: []const u8,
+    health: AccountAuthHealth,
+    reason: []const u8,
+) !void {
+    const idx = findAccountIndexByAccountKey(reg, account_key) orelse return error.AccountNotFound;
+    try setAccountAuthHealth(allocator, &reg.accounts.items[idx], health, reason);
+}
+
+pub fn accountAuthSnapshotUsable(rec: *const AccountRecord) bool {
+    return switch (rec.auth_health) {
+        .missing_auth, .malformed_auth, .account_mismatch, .quarantined => false,
+        else => rec.auth_quarantined_at == null,
+    };
+}
+
+pub fn accountAuthSelectable(rec: *const AccountRecord) bool {
+    if (!accountAuthSnapshotUsable(rec)) return false;
+    return rec.auth_health != .api_failed;
+}
+
+pub fn validateAccountSnapshotForAccount(
+    allocator: std.mem.Allocator,
+    codex_home: []const u8,
+    reg: *Registry,
+    account_key: []const u8,
+) !void {
+    const idx = findAccountIndexByAccountKey(reg, account_key) orelse return error.AccountNotFound;
+    if (reg.accounts.items[idx].auth_health == .quarantined or reg.accounts.items[idx].auth_quarantined_at != null) {
+        return error.AuthSnapshotQuarantined;
+    }
+
+    const auth_path = try accountAuthPath(allocator, codex_home, account_key);
+    defer allocator.free(auth_path);
+
+    var info = @import("auth.zig").parseAuthInfo(allocator, auth_path) catch |err| switch (err) {
+        error.FileNotFound => {
+            try markAccountAuthFailure(allocator, reg, account_key, .missing_auth, "account auth snapshot is missing");
+            return error.AuthSnapshotMissing;
+        },
+        error.OutOfMemory => return err,
+        else => {
+            try markAccountAuthFailure(allocator, reg, account_key, .malformed_auth, @errorName(err));
+            return error.AuthSnapshotInvalid;
+        },
+    };
+    defer info.deinit(allocator);
+
+    if (info.auth_mode != .chatgpt) {
+        try markAccountAuthFailure(allocator, reg, account_key, .malformed_auth, "not a ChatGPT auth snapshot");
+        return error.AuthSnapshotInvalid;
+    }
+    const record_key = info.record_key orelse {
+        try markAccountAuthFailure(allocator, reg, account_key, .malformed_auth, "auth snapshot is missing account identity");
+        return error.AuthSnapshotInvalid;
+    };
+    if (!std.mem.eql(u8, record_key, account_key)) {
+        try markAccountAuthFailure(allocator, reg, account_key, .account_mismatch, "auth snapshot belongs to a different account");
+        return error.AuthSnapshotAccountMismatch;
+    }
+
+    try markAccountAuthValid(allocator, reg, account_key);
 }
 
 pub fn remainingPercentAt(window: ?RateLimitWindow, now: i64) ?i64 {
@@ -1854,6 +2162,7 @@ pub fn activateAccountByKey(
     account_key: []const u8,
 ) !void {
     _ = findAccountIndexByAccountKey(reg, account_key) orelse return error.AccountNotFound;
+    try validateAccountSnapshotForAccount(allocator, codex_home, reg, account_key);
     const src = try resolveStrictAccountAuthPath(allocator, codex_home, account_key);
     defer allocator.free(src);
 
@@ -1872,6 +2181,7 @@ pub fn replaceActiveAuthWithAccountByKey(
     account_key: []const u8,
 ) !void {
     _ = findAccountIndexByAccountKey(reg, account_key) orelse return error.AccountNotFound;
+    try validateAccountSnapshotForAccount(allocator, codex_home, reg, account_key);
     const src = try resolveStrictAccountAuthPath(allocator, codex_home, account_key);
     defer allocator.free(src);
 
@@ -1915,6 +2225,11 @@ pub fn accountFromAuth(
         .last_usage = null,
         .last_usage_at = null,
         .last_local_rollout = null,
+        .auth_health = .valid,
+        .auth_checked_at = std.time.timestamp(),
+        .auth_verified_at = null,
+        .auth_error = null,
+        .auth_quarantined_at = null,
     };
 }
 
@@ -1949,6 +2264,15 @@ fn mergeAccountRecord(allocator: std.mem.Allocator, dest: *AccountRecord, incomi
     }
     if (dest.plan == null) dest.plan = merged_incoming.plan;
     if (dest.auth_mode == null) dest.auth_mode = merged_incoming.auth_mode;
+    if (merged_incoming.auth_health != .unknown) {
+        dest.auth_health = merged_incoming.auth_health;
+        dest.auth_checked_at = merged_incoming.auth_checked_at;
+        dest.auth_verified_at = merged_incoming.auth_verified_at;
+        dest.auth_quarantined_at = merged_incoming.auth_quarantined_at;
+        if (dest.auth_error) |existing| allocator.free(existing);
+        dest.auth_error = merged_incoming.auth_error;
+        merged_incoming.auth_error = null;
+    }
     freeAccountRecord(allocator, &merged_incoming);
 }
 
@@ -2088,6 +2412,16 @@ fn parseAccountRecord(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !Ac
     if (obj.get("last_local_rollout")) |v| {
         rec.last_local_rollout = parseRolloutSignature(allocator, v);
     }
+    if (obj.get("auth_health")) |v| {
+        switch (v) {
+            .string => |s| rec.auth_health = parseAccountAuthHealth(s) orelse .unknown,
+            else => {},
+        }
+    }
+    rec.auth_checked_at = readInt(obj.get("auth_checked_at"));
+    rec.auth_verified_at = readInt(obj.get("auth_verified_at"));
+    rec.auth_error = try parseOptionalStoredStringAlloc(allocator, obj.get("auth_error"));
+    rec.auth_quarantined_at = readInt(obj.get("auth_quarantined_at"));
     return rec;
 }
 
@@ -2526,6 +2860,18 @@ fn parseAuthMode(s: []const u8) ?AuthMode {
     return null;
 }
 
+fn parseAccountAuthHealth(s: []const u8) ?AccountAuthHealth {
+    if (std.mem.eql(u8, s, "unknown")) return .unknown;
+    if (std.mem.eql(u8, s, "valid")) return .valid;
+    if (std.mem.eql(u8, s, "verified")) return .verified;
+    if (std.mem.eql(u8, s, "missing_auth")) return .missing_auth;
+    if (std.mem.eql(u8, s, "malformed_auth")) return .malformed_auth;
+    if (std.mem.eql(u8, s, "account_mismatch")) return .account_mismatch;
+    if (std.mem.eql(u8, s, "api_failed")) return .api_failed;
+    if (std.mem.eql(u8, s, "quarantined")) return .quarantined;
+    return null;
+}
+
 fn parseUsage(allocator: std.mem.Allocator, v: std.json.Value) ?RateLimitSnapshot {
     const obj = switch (v) {
         .object => |o| o,
@@ -2546,7 +2892,6 @@ fn parseUsage(allocator: std.mem.Allocator, v: std.json.Value) ?RateLimitSnapsho
 }
 
 fn parseAutoSwitch(allocator: std.mem.Allocator, cfg: *AutoSwitchConfig, v: std.json.Value) void {
-    _ = allocator;
     const obj = switch (v) {
         .object => |o| o,
         else => return,
@@ -2554,6 +2899,65 @@ fn parseAutoSwitch(allocator: std.mem.Allocator, cfg: *AutoSwitchConfig, v: std.
     if (obj.get("enabled")) |enabled| {
         switch (enabled) {
             .bool => |flag| cfg.enabled = flag,
+            else => {},
+        }
+    }
+    if (obj.get("mode")) |mode| {
+        switch (mode) {
+            .string => |value| {
+                if (std.mem.eql(u8, value, "reactive")) cfg.mode = .reactive;
+                if (std.mem.eql(u8, value, "proactive")) cfg.mode = .proactive;
+                if (std.mem.eql(u8, value, "pinned")) cfg.mode = .pinned;
+                if (std.mem.eql(u8, value, "failover")) cfg.mode = .failover;
+            },
+            else => {},
+        }
+    }
+    if (obj.get("pinned_account_key")) |pinned_account_key| {
+        switch (pinned_account_key) {
+            .string => |value| {
+                if (cfg.pinned_account_key) |existing| allocator.free(existing);
+                cfg.pinned_account_key = allocator.dupe(u8, value) catch return;
+            },
+            .null => {
+                if (cfg.pinned_account_key) |existing| allocator.free(existing);
+                cfg.pinned_account_key = null;
+            },
+            else => {},
+        }
+    }
+    if (obj.get("failover_state")) |failover_state| {
+        switch (failover_state) {
+            .string => |value| {
+                if (std.mem.eql(u8, value, "idle")) cfg.failover_state = .idle;
+                if (std.mem.eql(u8, value, "processing")) cfg.failover_state = .processing;
+                if (std.mem.eql(u8, value, "switched")) cfg.failover_state = .switched;
+                if (std.mem.eql(u8, value, "no_target")) cfg.failover_state = .no_target;
+                if (std.mem.eql(u8, value, "no-target")) cfg.failover_state = .no_target;
+                if (std.mem.eql(u8, value, "stale_event")) cfg.failover_state = .stale_event;
+                if (std.mem.eql(u8, value, "stale-event")) cfg.failover_state = .stale_event;
+                if (std.mem.eql(u8, value, "error")) cfg.failover_state = .@"error";
+            },
+            else => {},
+        }
+    }
+    if (obj.get("blocked_account_key")) |blocked_account_key| {
+        switch (blocked_account_key) {
+            .string => |value| {
+                if (cfg.blocked_account_key) |existing| allocator.free(existing);
+                cfg.blocked_account_key = allocator.dupe(u8, value) catch return;
+            },
+            .null => {
+                if (cfg.blocked_account_key) |existing| allocator.free(existing);
+                cfg.blocked_account_key = null;
+            },
+            else => {},
+        }
+    }
+    if (obj.get("blocked_until_ms")) |blocked_until_ms| {
+        switch (blocked_until_ms) {
+            .integer => |value| cfg.blocked_until_ms = @intCast(value),
+            .null => cfg.blocked_until_ms = null,
             else => {},
         }
     }
@@ -2713,6 +3117,7 @@ pub fn autoImportActiveAuth(allocator: std.mem.Allocator, codex_home: []const u8
     defer allocator.free(dest);
 
     try ensureAccountsDir(allocator, codex_home);
+    try backupAccountSnapshotBeforeCopy(allocator, codex_home, dest, auth_path);
     try copyFile(auth_path, dest);
 
     const record = try accountFromAuth(allocator, "", &info);

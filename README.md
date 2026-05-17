@@ -9,6 +9,31 @@
 >
 > If you use the CLI and want seamless automatic account switching without restarting, use the forked [`codext`](https://github.com/Loongphy/codext), an enhanced Codex CLI. Install it with `npm i -g @loongphy/codext` and run `codext`.
 
+## Desktop UI
+
+There is also a small local Tauri app under [`apps/codex-auth-desktop`](./apps/codex-auth-desktop) if you prefer buttons over CLI commands.
+
+```shell
+npm run desktop:install
+npm run desktop:test
+npm run desktop:check
+npm run desktop:audit
+npm run desktop:run
+npm run desktop:dev
+npm run desktop:linux:check
+npm run desktop:linux:package
+npm run desktop:linux:install
+npm run desktop:linux:uninstall
+npm run desktop:windows:check
+npm run desktop:windows:package
+```
+
+The desktop app is a local Tauri app from this repo. It reads the current user's local `registry.json`, auto-refreshes every 10 seconds while the window is visible, bundles `codex-auth` into desktop installers, and still runs the real `codex-auth` commands for switching, warming, and login. `desktop:test` runs the frontend logic regression tests, `desktop:check` adds TypeScript and Rust checks, `desktop:audit` also builds the debug app and smoke-launches it, `desktop:run` launches the existing debug binary without starting a dev server, `desktop:linux:package` builds Fedora/Linux `.rpm` and AppImage packages, and `desktop:windows:package` builds a Windows 10 x64 NSIS `.exe` installer on Windows.
+
+End-user desktop downloads are attached to GitHub Releases. Release artifacts intentionally do not include any local account data from `~/.codex`, `~/.local/share/io.loongphy.codexauthstudio`, or a developer install under `~/.local/opt/codex-auth-studio`.
+
+If you have not built the debug binary yet, run `npm run desktop:audit` first. For desktop package notes, see [`apps/codex-auth-desktop/README.md`](./apps/codex-auth-desktop/README.md).
+
 ## Supported Platforms
 
 `codex-auth` works with these Codex clients:
@@ -94,9 +119,9 @@ Remove-Item "$env:LOCALAPPDATA\codex-auth\bin\codex-auth-auto.exe" -Force -Error
 |---------|-------------|
 | `codex-auth list` | List all accounts |
 | `codex-auth login [--device-auth]` | Run `codex login` (optionally with `--device-auth`), then add the current account |
-| `codex-auth switch [<email>]` | Switch active account interactively or by partial match |
+| `codex-auth switch [<email>\|--best]` | Switch active account interactively, by partial match, or to the best fresh known quota snapshot |
 | `codex-auth remove` | Remove accounts with interactive multi-select |
-| `codex-auth status` | Show auto-switch, service, and usage status |
+| `codex-auth status` | Show auto-switch, active auth/account, service, and API status |
 
 ### Import
 
@@ -111,6 +136,7 @@ Remove-Item "$env:LOCALAPPDATA\codex-auth\bin\codex-auth-auto.exe" -Force -Error
 | Command | Description |
 |---------|-------------|
 | `codex-auth config auto enable\|disable` | Enable or disable background auto-switching |
+| `codex-auth config auto mode <reactive\|proactive\|pinned\|failover>` | Choose whether auto-switch reacts on thresholds, keeps the best eligible account active, pins one known-best account, or only switches after a verified rate-limit failover event |
 | `codex-auth config auto [--5h <%>] [--weekly <%>]` | Set auto-switch thresholds |
 | `codex-auth config api enable\|disable` | Enable or disable both usage refresh and team name refresh API calls |
 
@@ -145,6 +171,14 @@ codex-auth switch work             # match by alias set during import
 ```
 
 If the keyword matches multiple accounts, the command falls back to interactive selection. Press `q` to quit without switching.
+
+Switch to the best fresh known quota snapshot:
+
+```shell
+codex-auth switch --best
+```
+
+`switch --best` chooses the account with the best fresh known quota snapshot. It skips `unknown`, `stale`, and temporarily blocked accounts, and it does not apply auto-switch thresholds.
 
 ### Remove Accounts
 
@@ -216,6 +250,17 @@ This does not import new files. It repairs the registry index for auth snapshots
 codex-auth status
 ```
 
+`status` reports:
+
+- whether auto-switching is enabled
+- whether the managed watcher is running
+- which usage mode is active (`usage: api` or `usage: local`)
+- whether the account API is enabled (`account API: api` or `account API: disabled`)
+- the current auth state (`active auth: ready|missing|malformed|untracked|api-key`)
+- the account currently being used by Codex (`active account: ...`)
+
+If `auth.json` and the registry disagree, `status` also prints a `registry active: ... (out of sync)` line to make the mismatch explicit.
+
 ### Config
 
 #### Auto-Switch
@@ -228,6 +273,20 @@ codex-auth config auto disable
 ```
 
 `config auto enable` prints the current usage mode after installing the watcher, so you can immediately see whether auto-switch is running with default API-backed usage or local-only fallback semantics.
+
+Choose the switching policy:
+
+```shell
+codex-auth config auto mode reactive
+codex-auth config auto mode proactive
+codex-auth config auto mode pinned
+codex-auth config auto mode failover
+```
+
+- `reactive` keeps the current behavior: only switch when the active account falls below threshold.
+- `proactive` keeps the best eligible account active whenever a better one is known.
+- `pinned` never auto-switches in the background. Use `codex-auth switch --best` or a manual `switch` to pin the account you want to keep during a `codext` session.
+- `failover` never threshold-switches in the background. It only switches after a verified usage-limit failover event from `codext`, then keeps the new account in place.
 
 Adjust thresholds:
 
@@ -285,6 +344,11 @@ codex-auth status
 ```
 
 `status` should show `usage: api`.
+
+If you also want to verify that Codex is currently pointed at the expected auth snapshot, `status` should show:
+
+- `active auth: ready`
+- `active account: <your email>`
 
 Upgrade notes:
 

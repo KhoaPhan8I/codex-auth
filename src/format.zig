@@ -52,11 +52,12 @@ fn printAccountsTable(reg: *registry.Registry) !void {
         if (row.account_index) |account_idx| {
             const rec = reg.accounts.items[account_idx];
             const plan = planDisplay(&rec, "-");
+            const freshness = registry.accountSnapshotFreshness(&rec, now);
             const rate_5h = resolveRateWindow(rec.last_usage, 300, true);
             const rate_week = resolveRateWindow(rec.last_usage, 10080, false);
-            const rate_5h_str = try formatRateLimitFullAlloc(rate_5h);
+            const rate_5h_str = try formatRateLimitFullAlloc(rate_5h, freshness);
             defer std.heap.page_allocator.free(rate_5h_str);
-            const rate_week_str = try formatRateLimitFullAlloc(rate_week);
+            const rate_week_str = try formatRateLimitFullAlloc(rate_week, freshness);
             defer std.heap.page_allocator.free(rate_week_str);
             const last_str = try timefmt.formatRelativeTimeOrDashAlloc(std.heap.page_allocator, rec.last_usage_at, now);
             defer std.heap.page_allocator.free(last_str);
@@ -106,11 +107,12 @@ fn printAccountsTable(reg: *registry.Registry) !void {
         if (row.account_index) |account_idx| {
             const rec = reg.accounts.items[account_idx];
             const plan = planDisplay(&rec, "-");
+            const freshness = registry.accountSnapshotFreshness(&rec, now);
             const rate_5h = resolveRateWindow(rec.last_usage, 300, true);
             const rate_week = resolveRateWindow(rec.last_usage, 10080, false);
-            const rate_5h_str = try formatRateLimitUiAlloc(rate_5h, widths[2]);
+            const rate_5h_str = try formatRateLimitUiAlloc(rate_5h, freshness, widths[2]);
             defer std.heap.page_allocator.free(rate_5h_str);
-            const rate_week_str = try formatRateLimitUiAlloc(rate_week, widths[3]);
+            const rate_week_str = try formatRateLimitUiAlloc(rate_week, freshness, widths[3]);
             defer std.heap.page_allocator.free(rate_week_str);
             const last = try timefmt.formatRelativeTimeOrDashAlloc(std.heap.page_allocator, rec.last_usage_at, now);
             defer std.heap.page_allocator.free(last);
@@ -251,7 +253,12 @@ fn resetPartsAlloc(reset_at: i64, now: i64) !ResetParts {
     };
 }
 
-fn formatRateLimitFullAlloc(window: ?registry.RateLimitWindow) ![]u8 {
+fn formatRateLimitFullAlloc(window: ?registry.RateLimitWindow, freshness: registry.SnapshotFreshness) ![]u8 {
+    switch (freshness) {
+        .unknown => return try std.fmt.allocPrint(std.heap.page_allocator, "unknown", .{}),
+        .stale => return try std.fmt.allocPrint(std.heap.page_allocator, "stale", .{}),
+        .fresh => {},
+    }
     if (window == null) return try std.fmt.allocPrint(std.heap.page_allocator, "-", .{});
     if (window.?.resets_at == null) return try std.fmt.allocPrint(std.heap.page_allocator, "-", .{});
     const now = std.time.timestamp();
@@ -268,7 +275,12 @@ fn formatRateLimitFullAlloc(window: ?registry.RateLimitWindow) ![]u8 {
     return std.fmt.allocPrint(std.heap.page_allocator, "{d}% ({s} on {s})", .{ remaining, parts.time, parts.date });
 }
 
-fn formatRateLimitUiAlloc(window: ?registry.RateLimitWindow, width: usize) ![]u8 {
+fn formatRateLimitUiAlloc(window: ?registry.RateLimitWindow, freshness: registry.SnapshotFreshness, width: usize) ![]u8 {
+    switch (freshness) {
+        .unknown => return try std.fmt.allocPrint(std.heap.page_allocator, "unknown", .{}),
+        .stale => return try std.fmt.allocPrint(std.heap.page_allocator, "stale", .{}),
+        .fresh => {},
+    }
     if (window == null) return try std.fmt.allocPrint(std.heap.page_allocator, "-", .{});
     if (window.?.resets_at == null) return try std.fmt.allocPrint(std.heap.page_allocator, "-", .{});
     const now = std.time.timestamp();
@@ -596,8 +608,18 @@ test "formatRateLimitFullAlloc shows 100% after reset instead of dash-prefixed v
         .resets_at = now - 60,
     };
 
-    const formatted = try formatRateLimitFullAlloc(window);
+    const formatted = try formatRateLimitFullAlloc(window, .fresh);
     defer std.heap.page_allocator.free(formatted);
 
     try std.testing.expectEqualStrings("100%", formatted);
+}
+
+test "formatRateLimitUiAlloc renders unknown and stale snapshot states explicitly" {
+    const unknown = try formatRateLimitUiAlloc(null, .unknown, 0);
+    defer std.heap.page_allocator.free(unknown);
+    try std.testing.expectEqualStrings("unknown", unknown);
+
+    const stale = try formatRateLimitUiAlloc(null, .stale, 0);
+    defer std.heap.page_allocator.free(stale);
+    try std.testing.expectEqualStrings("stale", stale);
 }

@@ -2,7 +2,26 @@
 zig-out/
 .zig-cache/
 dist/
+artifacts/
 *.tgz
+
+# Desktop app build artifacts
+apps/codex-auth-desktop/node_modules/
+apps/codex-auth-desktop/.ui-test-dist/
+apps/codex-auth-desktop/dist/
+apps/codex-auth-desktop/dist-ssr/
+apps/codex-auth-desktop/src-tauri/target/
+apps/codex-auth-desktop/src-tauri/resources/bin/
+apps/codex-auth-desktop/src-tauri/gen/schemas/
+
+# Local auth and account data must never be packaged into the repo.
+.codex/
+.env
+.env.*
+!.env.example
+auth.json
+*.auth.json
+registry.json
 
 # IDE/Editor
 .idea/
