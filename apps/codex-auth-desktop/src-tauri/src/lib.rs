@@ -956,6 +956,23 @@ fn start_login(
     Ok(state.snapshot())
 }
 
+fn cancel_login_watchdog(inner: Arc<std::sync::Mutex<LoginJobState>>) {
+    for _ in 0..50 {
+        if !inner.lock().map(|job| job.running).unwrap_or(false) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // Timeout fallback: force final state so the frontend is never stuck.
+    let mut job = inner.lock().expect("login state poisoned");
+    job.running = false;
+    job.finished = true;
+    job.finished_at = Some(now_label());
+    job.phase = LOGIN_PHASE_CANCELLED.to_string();
+    job.error = Some("Login cancelled (timeout).".to_string());
+    append_line(&mut job.output, "Login cancelled (timeout).");
+}
+
 #[tauri::command]
 fn cancel_login(state: tauri::State<'_, LoginState>) -> Result<LoginSnapshot, String> {
     let is_running = {
@@ -982,25 +999,15 @@ fn cancel_login(state: tauri::State<'_, LoginState>) -> Result<LoginSnapshot, St
         }
         job.cancelled = true;
     }
-    // Wait for the background thread to detect the flag, kill the child
-    // process, and set running=false. The background loop checks every
-    // 200ms, so polling 50 times at 100ms (5s total) is safe.
-    for _ in 0..50 {
-        if !state.inner.lock().map_err(|_| "Login state poisoned")?.running {
-            return Ok(state.snapshot());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    // Timeout fallback: force final state so the frontend is never stuck.
-    {
-        let mut job = state.inner.lock().map_err(|_| "Login state poisoned")?;
-        job.running = false;
-        job.finished = true;
-        job.finished_at = Some(now_label());
-        job.phase = LOGIN_PHASE_CANCELLED.to_string();
-        job.error = Some("Login cancelled (timeout).".to_string());
-        append_line(&mut job.output, "Login cancelled (timeout).");
-    }
+    // Spawn watchdog on a separate thread so the IPC thread is not blocked.
+    // The watchdog waits for the background thread to detect the flag
+    // (checking running every 100ms, up to 5s), then force-sets final state
+    // on timeout. This keeps clear_login_state and other IPC commands
+    // responsive during cancellation.
+    std::thread::spawn({
+        let inner = Arc::clone(&state.inner);
+        move || cancel_login_watchdog(inner)
+    });
     Ok(state.snapshot())
 }
 

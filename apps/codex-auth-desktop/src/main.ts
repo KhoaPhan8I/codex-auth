@@ -483,7 +483,7 @@ async function handleAction(action: string, target: HTMLElement) {
       await startLogin(false);
       return;
     case "cancel-login":
-      await cancelLogin();
+      cancelLogin();
       return;
     case "dismiss-login":
       await dismissLogin();
@@ -768,8 +768,9 @@ async function dismissLogin() {
 async function cancelLogin() {
   state.busy = true;
   render();
-  // Fire-and-forget the Rust cancel; don't wait for it.
-  const promise = invoke<LoginSnapshot>("cancel_login").catch(() => {});
+  // Truly fire-and-forget: the Rust cancel_login spawns a watchdog thread
+  // so the IPC channel stays responsive for dismiss/dashboard calls.
+  invoke<LoginSnapshot>("cancel_login").catch(() => {});
   // Immediately update frontend state so the user sees instant feedback.
   if (state.dashboard) {
     state.dashboard.login = {
@@ -786,7 +787,6 @@ async function cancelLogin() {
   state.busy = false;
   syncDashboardRefresh();
   render();
-  await promise;
 }
 
 function syncLoginPolling() {
