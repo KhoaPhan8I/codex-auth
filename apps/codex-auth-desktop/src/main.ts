@@ -227,6 +227,7 @@ const state = {
   cliOverrideInput: "",
   cliOverrideDirty: false,
   language: loadLanguage(),
+  _loginDismissed: false,
 };
 
 const INVOKE_TIMEOUT_MS = 30000;
@@ -486,7 +487,7 @@ async function handleAction(action: string, target: HTMLElement) {
       cancelLogin();
       return;
     case "dismiss-login":
-      await dismissLogin();
+      dismissLogin();
       return;
     case "set-scope":
       state.scope = (target.dataset.scope as FilterScope) ?? "all";
@@ -637,13 +638,18 @@ async function runDashboardRequest(silent = false) {
 }
 
 function applyDashboard(dashboard: DashboardPayload) {
-  const login = state.dashboard?.login;
+  const prev = state.dashboard?.login;
   state.dashboard = dashboard;
   // Preserve frontend login state after user-cancelled so an in-flight
   // dashboard response cannot overwrite the optimistic "cancelled" state
   // and resurrect the login modal.
-  if (login?.cancelled) {
-    state.dashboard.login = login;
+  if (prev?.cancelled) {
+    state.dashboard.login = prev;
+  }
+  // After user dismisses login, the backend may still have running=true
+  // for a few hundred ms. Prevent the modal from being reanimated.
+  if (state._loginDismissed) {
+    clearLoginState();
   }
   if (!state.cliOverrideDirty) {
     state.cliOverrideInput = dashboard.cliRuntime.overridePath ?? "";
@@ -695,7 +701,7 @@ async function performImmediateAction(
 }
 
 async function startLogin(deviceAuth: boolean, isolated: boolean = false) {
-  state.busy = true;
+  state._loginDismissed = false;
   state.messageRevision += 1;
   clearMessages();
   render();
@@ -723,52 +729,31 @@ async function startLogin(deviceAuth: boolean, isolated: boolean = false) {
   }
 }
 
-async function dismissLogin() {
-  state.busy = true;
+function clearLoginState() {
+  if (!state.dashboard) { return; }
+  state.dashboard.login = {
+    running: false, finished: false, success: false, deviceAuth: false,
+    isolated: false, output: "", loginUrl: null, isolatedSessionId: null,
+    startedAt: null, finishedAt: null, exitCode: null, error: null,
+    cancelled: false, refreshTokenReused: false, phase: "",
+    browserUrlOpened: false, importStarted: false, importFinished: false,
+    diagnostic: null,
+  };
+}
+
+function dismissLogin() {
+  const sessionId = state.dashboard?.login.isolatedSessionId ?? null;
+  // Optimistically clear frontend state immediately — no IPC wait.
+  clearLoginState();
+  state._loginDismissed = true;
+  syncLoginPolling();
+  syncDashboardRefresh();
   render();
-  try {
-    const sessionId = state.dashboard?.login.isolatedSessionId ?? null;
-    // Retry clear_login_state until the backend acknowledges.
-    // The background thread finishes within ~200ms of cancellation,
-    // so a few retries (up to 3s) is more than sufficient.
-    let cleared = false;
-    for (let i = 0; i < 30; i++) {
-      try {
-        const login = await invoke<LoginSnapshot>("clear_login_state");
-        if (state.dashboard) {
-          state.dashboard.login = login;
-        }
-        cleared = true;
-        break;
-      } catch {
-        await new Promise((r) => setTimeout(r, 100));
-      }
-    }
-    if (!cleared && state.dashboard) {
-      // Final fallback: clear frontend state optimistically.
-      state.dashboard.login = {
-        running: false, finished: false, success: false, deviceAuth: false,
-        isolated: false, output: "", loginUrl: null, isolatedSessionId: null,
-        startedAt: null, finishedAt: null, exitCode: null, error: null,
-        cancelled: false, refreshTokenReused: false, phase: "",
-        browserUrlOpened: false, importStarted: false, importFinished: false,
-        diagnostic: null,
-      };
-    }
-    if (sessionId) {
-      try {
-        await invoke("cleanup_isolated_session", { sessionId });
-      } catch {
-        // Best-effort cleanup; ignore errors.
-      }
-    }
-  } catch (error) {
-    setErrorFromUnknown(error);
-  } finally {
-    state.busy = false;
-    syncLoginPolling();
-    syncDashboardRefresh();
-    render();
+  // Fire-and-forget backend cleanup so the Rust state eventually
+  // catches up, but the UI is not blocked waiting for it.
+  invoke<LoginSnapshot>("clear_login_state").catch(() => {});
+  if (sessionId) {
+    invoke("cleanup_isolated_session", { sessionId }).catch(() => {});
   }
 }
 
@@ -1607,7 +1592,7 @@ function renderLoginPanel() {
 
 function renderLoginModal() {
   const login = state.dashboard?.login;
-  if (!login || (!login.running && !login.finished && !login.output)) {
+  if (state._loginDismissed || !login || (!login.running && !login.finished && !login.output)) {
     return "";
   }
   const phaseLabel = loginPhaseLabel(login.phase);
