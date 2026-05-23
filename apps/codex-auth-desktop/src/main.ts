@@ -746,12 +746,34 @@ async function cancelLogin() {
   state.busy = true;
   render();
   try {
-    const login = await invoke<LoginSnapshot>("cancel_login");
-    if (state.dashboard) {
-      state.dashboard.login = login;
+    await invoke<LoginSnapshot>("cancel_login");
+    // Poll until the background thread acknowledges cancellation
+    // (checked every 200ms in Rust, so 2s timeout is safe).
+    for (let i = 0; i < 20; i++) {
+      const next = await invokeWithTimeout<LoginSnapshot>("get_login_state", undefined, 3000);
+      if (state.dashboard) {
+        state.dashboard.login = next;
+      }
+      if (!next.running) {
+        setNoticeDescriptor("noticeCancelledLogin");
+        syncLoginPolling();
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 100));
     }
-    setNoticeDescriptor("noticeCancelledLogin");
+    // Timeout fallback — force-dismiss even if backend is still running.
+    if (state.dashboard) {
+      state.dashboard.login = {
+        ...state.dashboard.login,
+        running: false,
+        finished: true,
+        cancelled: true,
+        phase: "cancelled",
+        output: (state.dashboard.login?.output ?? "") + "\nLogin cancelled (timeout).",
+      };
+    }
     syncLoginPolling();
+    setNoticeDescriptor("noticeCancelledLogin");
   } catch (error) {
     setErrorFromUnknown(error);
   } finally {
