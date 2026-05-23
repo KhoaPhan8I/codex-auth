@@ -983,14 +983,23 @@ fn cancel_login(state: tauri::State<'_, LoginState>) -> Result<LoginSnapshot, St
         job.cancelled = true;
     }
     // Wait for the background thread to detect the flag, kill the child
-    // process, and set running=false. The Rust loop checks every 200ms,
-    // so polling 20 times at 100ms (2s total) is more than sufficient.
-    for _ in 0..20 {
-        let done = state.inner.lock().map_err(|_| "Login state poisoned")?.running;
-        if !done {
+    // process, and set running=false. The background loop checks every
+    // 200ms, so polling 50 times at 100ms (5s total) is safe.
+    for _ in 0..50 {
+        if !state.inner.lock().map_err(|_| "Login state poisoned")?.running {
             return Ok(state.snapshot());
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // Timeout fallback: force final state so the frontend is never stuck.
+    {
+        let mut job = state.inner.lock().map_err(|_| "Login state poisoned")?;
+        job.running = false;
+        job.finished = true;
+        job.finished_at = Some(now_label());
+        job.phase = LOGIN_PHASE_CANCELLED.to_string();
+        job.error = Some("Login cancelled (timeout).".to_string());
+        append_line(&mut job.output, "Login cancelled (timeout).");
     }
     Ok(state.snapshot())
 }
