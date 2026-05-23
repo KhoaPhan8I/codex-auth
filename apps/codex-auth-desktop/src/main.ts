@@ -702,30 +702,47 @@ async function performImmediateAction(
 
 async function startLogin(deviceAuth: boolean, isolated: boolean = false) {
   state._loginDismissed = false;
+  state.busy = true;
   state.messageRevision += 1;
   clearMessages();
   render();
 
-  try {
-    const login = await invoke<LoginSnapshot>("start_login", { deviceAuth, isolated });
-    if (state.dashboard) {
-      state.dashboard.login = login;
+  // If a previous login flow is still finishing on the Rust side,
+  // retry a few times before giving up.
+  for (let attempt = 0; attempt < 30; attempt++) {
+    try {
+      const login = await invoke<LoginSnapshot>("start_login", { deviceAuth, isolated });
+      if (state.dashboard) {
+        state.dashboard.login = login;
+      }
+      if (isolated) {
+        setNoticeDescriptor("noticeIsolatedLoginStarted");
+      } else if (deviceAuth) {
+        setNoticeDescriptor("noticeDeviceLoginStarted");
+      } else {
+        setNoticeDescriptor("noticeBrowserLoginStarted");
+      }
+      syncLoginPolling();
+      state.busy = false;
+      syncDashboardRefresh();
+      syncActionPolling();
+      render();
+      return;
+    } catch (error) {
+      const msg = asMessage(error);
+      if (msg.includes("already running") || msg.includes("login flow")) {
+        if (attempt < 29) {
+          await new Promise((r) => setTimeout(r, 200));
+          continue;
+        }
+      }
+      setErrorFromUnknown(error);
+      state.busy = false;
+      syncDashboardRefresh();
+      syncActionPolling();
+      render();
+      return;
     }
-    if (isolated) {
-      setNoticeDescriptor("noticeIsolatedLoginStarted");
-    } else if (deviceAuth) {
-      setNoticeDescriptor("noticeDeviceLoginStarted");
-    } else {
-      setNoticeDescriptor("noticeBrowserLoginStarted");
-    }
-    syncLoginPolling();
-  } catch (error) {
-    setErrorFromUnknown(error);
-  } finally {
-    state.busy = false;
-    syncDashboardRefresh();
-    syncActionPolling();
-    render();
   }
 }
 
@@ -749,9 +766,18 @@ function dismissLogin() {
   syncLoginPolling();
   syncDashboardRefresh();
   render();
-  // Fire-and-forget backend cleanup so the Rust state eventually
-  // catches up, but the UI is not blocked waiting for it.
-  invoke<LoginSnapshot>("clear_login_state").catch(() => {});
+  // Keep trying to clear the Rust backend state in the background
+  // so the next "Add account" attempt doesn't see a stale running flow.
+  (async () => {
+    for (let i = 0; i < 50; i++) {
+      try {
+        await invoke<LoginSnapshot>("clear_login_state");
+        break;
+      } catch {
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    }
+  })();
   if (sessionId) {
     invoke("cleanup_isolated_session", { sessionId }).catch(() => {});
   }
