@@ -156,3 +156,17 @@ systemctl --user start codex-auth-health.service
 - **Registry drift**: `import --purge` can set `active_account_key` to a stale account. Health script auto-fixes it.
 - **401 false positive**: Historical 401s in journal from old daemon instances can trigger rotation on first run after restart (resolves automatically after 15min).
 - **Token expiry without warm**: All accounts have `refresh_token` + `offline_access` scope, but `codex-auth warm` requires a GUI session (`NoUsableWindows`). Accounts expire after ~9 days regardless.
+
+## Desktop App Freeze Fix
+
+The Codex Auth Studio desktop app (`apps/codex-auth-desktop`) can freeze when left open for extended periods. Root causes and fixes:
+
+### Root Causes
+1. **No timeout on `invoke("get_dashboard")`** (`src/main.ts:571`) — If the Rust backend hangs (e.g., `codex-auth status` waiting on a locked `registry.json`), the JS Promise never resolves, `dashboardRequestInFlight` stays `true`, and the UI stops refreshing permanently.
+2. **Request cascade loop** (`src/main.ts:597-601`) — If a dashboard request takes >10s (the refresh interval), each subsequent tick queues another request. The `finally` block processes one queue entry recursively, creating an infinite chain until a request completes in <10s.
+3. **Full DOM replace every 10s** (`render()`) — `root.innerHTML = ...` rebuilds the entire DOM each cycle. Over hours/days, WebKitGTK accumulates memory from repeated DOM churn, gradually slowing the UI until it freezes.
+
+### Fixes Applied
+1. **`invokeWithTimeout()` wrapper** — Wraps all polling `invoke` calls with a 30s timeout (15s for fast pollers). If the Rust command hangs, the Promise rejects, the `catch` handler runs, and `dashboardRequestInFlight` resets, allowing the UI to recover.
+2. **`MAX_CASCADE_DEPTH = 3`** — Limits recursive queue processing to 3 levels. After 3 consecutive cascaded requests, the queue is drained and the system returns to the normal 10s cycle.
+3. **Render guard hash** — Computes a hash of all render-affecting state (dashboard data, filter, scope, sort, error/notice, language, busy/loading flags). Skips `root.innerHTML = ...` if nothing changed, cutting DOM churn from 360x/hour to near-zero during idle periods.

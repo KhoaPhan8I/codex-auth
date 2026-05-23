@@ -229,6 +229,9 @@ const state = {
   language: loadLanguage(),
 };
 
+const INVOKE_TIMEOUT_MS = 30000;
+const MAX_CASCADE_DEPTH = 3;
+
 let loginPollTimer: number | null = null;
 let actionPollTimer: number | null = null;
 let quotaPollTimer: number | null = null;
@@ -237,7 +240,9 @@ let dashboardRequestInFlight = false;
 let queuedDashboardSilent: boolean | null = null;
 let dashboardRequestSeq = 0;
 let dashboardAppliedSeq = 0;
+let dashboardRequestCascadeDepth = 0;
 let quotaPollInFlight = false;
+let renderGuardHash: string | null = null;
 
 type FocusSnapshot = {
   id: string;
@@ -547,10 +552,29 @@ async function handleAction(action: string, target: HTMLElement) {
   }
 }
 
+function invokeWithTimeout<T>(command: string, args?: Record<string, unknown>, ms = INVOKE_TIMEOUT_MS): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`Invoke "${command}" timed out after ${ms}ms`));
+    }, ms);
+    invoke<T>(command, args)
+      .then((result) => {
+        clearTimeout(timer);
+        resolve(result);
+      })
+      .catch((err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
+}
+
 async function requestDashboard(silent = false) {
   if (dashboardRequestInFlight) {
-    queuedDashboardSilent =
-      queuedDashboardSilent === null ? silent : queuedDashboardSilent && silent;
+    if (queuedDashboardSilent === null) {
+      queuedDashboardSilent = silent;
+      dashboardRequestCascadeDepth = 0;
+    }
     return;
   }
 
@@ -558,6 +582,13 @@ async function requestDashboard(silent = false) {
 }
 
 async function runDashboardRequest(silent = false) {
+  if (dashboardRequestCascadeDepth >= MAX_CASCADE_DEPTH) {
+    dashboardRequestCascadeDepth = 0;
+    queuedDashboardSilent = null;
+    dashboardRequestInFlight = false;
+    return;
+  }
+
   dashboardRequestInFlight = true;
   const requestSeq = ++dashboardRequestSeq;
 
@@ -568,7 +599,7 @@ async function runDashboardRequest(silent = false) {
   }
 
   try {
-    const dashboard = await invoke<DashboardPayload>("get_dashboard");
+    const dashboard = await invokeWithTimeout<DashboardPayload>("get_dashboard");
     if (requestSeq < dashboardAppliedSeq) {
       return;
     }
@@ -597,7 +628,10 @@ async function runDashboardRequest(silent = false) {
     if (queuedDashboardSilent !== null) {
       const nextSilent = queuedDashboardSilent;
       queuedDashboardSilent = null;
+      dashboardRequestCascadeDepth++;
       void runDashboardRequest(nextSilent);
+    } else {
+      dashboardRequestCascadeDepth = 0;
     }
   }
 }
@@ -777,7 +811,7 @@ async function refreshQuotaConfirmState() {
   quotaPollInFlight = true;
   const wasRunning = state.dashboard.quotaConfirm.running;
   try {
-    const next = await invoke<QuotaConfirmSnapshot>("get_quota_confirm_state");
+    const next = await invokeWithTimeout<QuotaConfirmSnapshot>("get_quota_confirm_state", undefined, 15000);
     if (!state.dashboard) {
       return;
     }
@@ -828,7 +862,7 @@ async function refreshActionState() {
 
   const messageRevision = state.pendingActionRevision;
   try {
-    const next = await invoke<ActionSnapshot>("get_action_state");
+    const next = await invokeWithTimeout<ActionSnapshot>("get_action_state", undefined, 15000);
     state.dashboard.action = next;
     if (messageRevision === state.messageRevision) {
       state.consoleText = next.output.trim();
@@ -878,7 +912,7 @@ async function refreshLoginState() {
 
   const messageRevision = state.messageRevision;
   try {
-    const next = await invoke<LoginSnapshot>("get_login_state");
+    const next = await invokeWithTimeout<LoginSnapshot>("get_login_state", undefined, 15000);
     const wasRunning = state.dashboard.login.running;
     state.dashboard.login = next;
 
@@ -918,6 +952,30 @@ function render() {
   if (!root) {
     return;
   }
+
+  const guardParts = [
+    JSON.stringify(state.dashboard?.accounts ?? null),
+    state.dashboard?.summary.totalAccounts,
+    state.dashboard?.version,
+    state.filter,
+    state.scope,
+    state.sortMode,
+    state.error,
+    state.notice,
+    state.loading,
+    state.busy,
+    state.language,
+    state.dashboard?.status.service,
+    state.dashboard?.status.activeAccount,
+    state.dashboard?.summary.autoSwitchEnabled,
+    state.dashboard?.summary.autoSwitchMode,
+    state.dashboard?.login.running,
+  ];
+  const guardHash = guardParts.join("|");
+  if (guardHash === renderGuardHash) {
+    return;
+  }
+  renderGuardHash = guardHash;
 
   const focusSnapshot = captureFocusSnapshot();
   const scrollSnapshot = captureScrollSnapshot();
