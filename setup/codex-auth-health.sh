@@ -153,7 +153,34 @@ for f in glob.glob(auth_dir + '*.auth.json'):
     echo "[OK] Daemon restarted after rotation"
   fi
 
-  # 9. Daemon healthy?
+  # 9. Sync registry ↔ auth.json (fix "unknown email" in codext)
+  AUTH_EMAIL=$(python3 -c "
+import json,base64
+with open('$AUTH_DIR/../auth.json') as a:
+    d = json.load(a)
+it = d.get('tokens',{}).get('id_token','')
+if it:
+    ip = it.split('.')[1]; pad = 4 - len(ip) % 4
+    if pad != 4: ip += '=' * pad
+    ij = json.loads(base64.urlsafe_b64decode(ip))
+    print(ij.get('email','?'))
+" 2>/dev/null)
+  REG_EMAIL=$(python3 -c "
+import json
+with open('$AUTH_DIR/registry.json') as r:
+    reg = json.load(r)
+ak = reg.get('active_account_key','')
+for a in reg.get('accounts',[]):
+    if a.get('account_key') == ak:
+        print(a.get('email','?')); break
+" 2>/dev/null)
+  if [ -n "$AUTH_EMAIL" ] && [ -n "$REG_EMAIL" ] && [ "$AUTH_EMAIL" != "$REG_EMAIL" ]; then
+    echo "[SYNC] Mismatch: auth.json=$AUTH_EMAIL != registry=$REG_EMAIL → fixing..."
+    codex-auth switch "$AUTH_EMAIL" 2>/dev/null || true
+    echo "[SYNC] Done"
+  fi
+
+  # 10. Daemon healthy?
   if systemctl --user is-active --quiet "$SERVICE"; then
     echo "[OK] Daemon healthy"
   fi
