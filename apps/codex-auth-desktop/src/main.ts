@@ -721,9 +721,38 @@ async function dismissLogin() {
   render();
   try {
     const sessionId = state.dashboard?.login.isolatedSessionId ?? null;
-    const login = await invoke<LoginSnapshot>("clear_login_state");
-    if (state.dashboard) {
-      state.dashboard.login = login;
+    try {
+      const login = await invoke<LoginSnapshot>("clear_login_state");
+      if (state.dashboard) {
+        state.dashboard.login = login;
+      }
+    } catch {
+      // Backend may reject clear_login_state if the background thread
+      // hasn't finished yet (running still true). Clear frontend state
+      // optimistically so the user is never stuck.
+      if (state.dashboard) {
+        state.dashboard.login = {
+          running: false,
+          finished: false,
+          success: false,
+          deviceAuth: false,
+          isolated: false,
+          output: "",
+          loginUrl: null,
+          isolatedSessionId: null,
+          startedAt: null,
+          finishedAt: null,
+          exitCode: null,
+          error: null,
+          cancelled: false,
+          refreshTokenReused: false,
+          phase: "",
+          browserUrlOpened: false,
+          importStarted: false,
+          importFinished: false,
+          diagnostic: null,
+        };
+      }
     }
     if (sessionId) {
       try {
@@ -747,21 +776,8 @@ async function cancelLogin() {
   render();
   try {
     await invoke<LoginSnapshot>("cancel_login");
-    // Poll until the background thread acknowledges cancellation
-    // (checked every 200ms in Rust, so 2s timeout is safe).
-    for (let i = 0; i < 20; i++) {
-      const next = await invokeWithTimeout<LoginSnapshot>("get_login_state", undefined, 3000);
-      if (state.dashboard) {
-        state.dashboard.login = next;
-      }
-      if (!next.running) {
-        setNoticeDescriptor("noticeCancelledLogin");
-        syncLoginPolling();
-        return;
-      }
-      await new Promise((r) => setTimeout(r, 100));
-    }
-    // Timeout fallback — force-dismiss even if backend is still running.
+    // Optimistically mark cancelled on the frontend so the user sees
+    // immediate feedback; the background thread will finish within ~200ms.
     if (state.dashboard) {
       state.dashboard.login = {
         ...state.dashboard.login,
@@ -769,7 +785,7 @@ async function cancelLogin() {
         finished: true,
         cancelled: true,
         phase: "cancelled",
-        output: (state.dashboard.login?.output ?? "") + "\nLogin cancelled (timeout).",
+        output: (state.dashboard.login?.output ?? "") + "\nLogin cancelled.",
       };
     }
     syncLoginPolling();

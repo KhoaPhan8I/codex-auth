@@ -982,6 +982,16 @@ fn cancel_login(state: tauri::State<'_, LoginState>) -> Result<LoginSnapshot, St
         }
         job.cancelled = true;
     }
+    // Wait for the background thread to detect the flag, kill the child
+    // process, and set running=false. The Rust loop checks every 200ms,
+    // so polling 20 times at 100ms (2s total) is more than sufficient.
+    for _ in 0..20 {
+        let done = state.inner.lock().map_err(|_| "Login state poisoned")?.running;
+        if !done {
+            return Ok(state.snapshot());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     Ok(state.snapshot())
 }
 
