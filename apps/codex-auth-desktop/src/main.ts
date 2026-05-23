@@ -970,6 +970,11 @@ function render() {
     state.dashboard?.summary.autoSwitchEnabled,
     state.dashboard?.summary.autoSwitchMode,
     state.dashboard?.login.running,
+    state.dashboard?.login.finished,
+    state.dashboard?.login.phase,
+    state.dashboard?.login.loginUrl,
+    state.dashboard?.login.output?.length,
+    state.dashboard?.login.diagnostic,
   ];
   const guardHash = guardParts.join("|");
   if (guardHash === renderGuardHash) {
@@ -1561,51 +1566,8 @@ function renderLoginPanel() {
   if (!login || (!login.running && !login.finished && !login.output)) {
     return "";
   }
-  const phaseLabel = loginPhaseLabel(login.phase);
-
-  return `
-    <details class="panel utility-panel login-panel" ${login.running ? "open" : ""}>
-      <summary class="utility-summary">
-        <span>${escapeHtml(t("login"))}</span>
-        <strong>${login.running ? escapeHtml(t("loginRunning")) : login.success ? escapeHtml(t("loginDone")) : escapeHtml(t("loginFinished"))}</strong>
-      </summary>
-      <div class="login-meta">
-        <div>
-          <span>${login.isolated ? escapeHtml(t("isolatedLogin")) : login.deviceAuth ? escapeHtml(t("deviceAuth")) : escapeHtml(t("browserAuth"))}</span>
-          <strong>${login.startedAt ?? "-"}</strong>
-        </div>
-        <div>
-          <span>${escapeHtml(t("loginPhase"))}</span>
-          <strong>${escapeHtml(phaseLabel)}</strong>
-        </div>
-        <div class="login-actions">
-          ${
-            login.loginUrl
-              ? `<button class="ghost-button" data-action="open-login-url" type="button">${escapeHtml(t("openLoginUrl"))}</button>
-                 <button class="ghost-button" data-action="copy-login-url" type="button">${escapeHtml(t("copyLoginUrl"))}</button>`
-              : ""
-          }
-          ${
-            login.running
-              ? `<button class="ghost-button danger-button" data-action="cancel-login" ${state.busy ? "disabled" : ""} type="button">${escapeHtml(t("cancelLogin"))}</button>`
-              : ""
-          }
-          ${
-            !login.running
-              ? `<button class="ghost-button" data-action="dismiss-login" ${state.busy ? "disabled" : ""} type="button">${escapeHtml(t("dismiss"))}</button>`
-              : ""
-          }
-        </div>
-      </div>
-      ${
-        login.loginUrl
-          ? `<p class="login-url">${escapeHtml(login.loginUrl)}</p>`
-          : ""
-      }
-      ${login.diagnostic ? `<p class="login-diagnostic">${escapeHtml(login.diagnostic)}</p>` : ""}
-      <pre class="console">${escapeHtml(login.output || t("waitingLoginOutput"))}</pre>
-    </details>
-  `;
+  // Modal overlay handles this state; skip redundant utility panel.
+  return "";
 }
 
 function renderLoginModal() {
