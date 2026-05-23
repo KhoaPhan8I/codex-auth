@@ -1317,3 +1317,222 @@ button:not(.ghost-button):not(:disabled):hover {
     white-space: normal;
   }
 }
+
+.login-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgb(0 0 0 / 0.55);
+  backdrop-filter: blur(4px);
+  animation: fadeIn 160ms ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.login-modal {
+  width: min(560px, calc(100vw - 40px));
+  max-height: calc(100vh - 40px);
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: 0 24px 64px rgb(0 0 0 / 0.5);
+  animation: slideUp 200ms ease;
+}
+
+@keyframes slideUp {
+  from { transform: translateY(16px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+.login-modal-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.login-modal-icon {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: var(--surface-3);
+  flex: 0 0 auto;
+}
+
+.login-modal-icon.is-success {
+  background: var(--ok-bg);
+  color: var(--accent);
+}
+
+.login-modal-icon.is-failed {
+  background: var(--error-bg);
+  color: var(--danger);
+}
+
+.login-modal-icon.spin .ui-icon {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.login-modal-info {
+  min-width: 0;
+  flex: 1;
+}
+
+.login-modal-title {
+  display: block;
+  font-size: 0.95rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.login-modal-status {
+  display: block;
+  margin-top: 2px;
+  font-size: 0.78rem;
+  color: var(--fg-soft);
+}
+
+.login-modal-close {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  flex: 0 0 auto;
+}
+
+.login-modal-body {
+  padding: 14px 16px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.login-modal-meta {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.login-meta-item {
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--bg-soft);
+}
+
+.login-meta-item span {
+  display: block;
+  text-transform: uppercase;
+  letter-spacing: 0.13em;
+  font-size: 0.6rem;
+  color: var(--fg-soft);
+}
+
+.login-meta-item strong {
+  display: block;
+  margin-top: 4px;
+  font-size: 0.82rem;
+}
+
+.login-modal-output {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--bg);
+  font-size: 0.78rem;
+  line-height: 1.5;
+  max-height: 160px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.login-url-details {
+  margin-bottom: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg-soft);
+}
+
+.login-url-details summary {
+  padding: 8px 10px;
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: 0.13em;
+  font-size: 0.6rem;
+  color: var(--fg-soft);
+  user-select: none;
+}
+
+.login-url-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.login-url-row {
+  padding: 0 10px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.login-url-input {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--fg-muted);
+  font-size: 0.75rem;
+  font-family: inherit;
+}
+
+.login-url-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.login-url-actions .ghost-button {
+  flex: 1;
+  justify-content: center;
+  min-height: 30px;
+  font-size: 0.75rem;
+}
+
+.login-diagnostic {
+  margin: 0 0 6px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--warn-bg);
+  color: var(--warn);
+  font-size: 0.75rem;
+}
+
+.login-modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--line);
+}
+
+.login-modal-footer .danger-button {
+  justify-content: center;
+  min-width: 100px;
+}

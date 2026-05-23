@@ -1081,6 +1081,7 @@ function render() {
 
       ${renderUtilityPanels()}
     </main>
+    ${renderLoginModal()}
   `;
 
   restoreFocusSnapshot(focusSnapshot);
@@ -1604,6 +1605,70 @@ function renderLoginPanel() {
       ${login.diagnostic ? `<p class="login-diagnostic">${escapeHtml(login.diagnostic)}</p>` : ""}
       <pre class="console">${escapeHtml(login.output || t("waitingLoginOutput"))}</pre>
     </details>
+  `;
+}
+
+function renderLoginModal() {
+  const login = state.dashboard?.login;
+  if (!login || (!login.running && !login.finished && !login.output)) {
+    return "";
+  }
+  const phaseLabel = loginPhaseLabel(login.phase);
+
+  return `
+    <div class="login-modal-backdrop">
+      <div class="login-modal" role="dialog" aria-label="${escapeAttribute(t("login"))}">
+        <div class="login-modal-header">
+          <div class="login-modal-icon ${login.running ? "spin" : login.success ? "is-success" : "is-failed"}">${login.running ? icon("refresh") : login.success ? `<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 13l4 4L19 7"/></svg>` : `<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18"/><path d="M6 6 18 18"/></svg>`}</div>
+          <div class="login-modal-info">
+            <strong class="login-modal-title">${login.isolated ? escapeHtml(t("isolatedLogin")) : login.deviceAuth ? escapeHtml(t("deviceAuth")) : escapeHtml(t("browserAuth"))}</strong>
+            <span class="login-modal-status">${login.running ? escapeHtml(t("loginRunning")) : login.success ? escapeHtml(t("loginDone")) : escapeHtml(t("loginFinished"))}</span>
+          </div>
+          ${!login.running ? `
+            <button class="ghost-button login-modal-close" data-action="dismiss-login" aria-label="${escapeAttribute(t("dismiss"))}">
+              <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18"/><path d="M6 6 18 18"/></svg>
+            </button>
+          ` : ""}
+        </div>
+        <div class="login-modal-body">
+          <div class="login-modal-meta">
+            <div class="login-meta-item login-phase-item">
+              <span>${escapeHtml(t("loginPhase"))}</span>
+              <strong>${escapeHtml(phaseLabel)}</strong>
+            </div>
+            <div class="login-meta-item">
+              <span>${escapeHtml(t("startedAt"))}</span>
+              <strong>${login.startedAt ?? "-"}</strong>
+            </div>
+          </div>
+          <pre class="console login-modal-output">${escapeHtml(login.output || t("waitingLoginOutput"))}</pre>
+          ${login.loginUrl ? `
+            <details class="login-url-details" open>
+              <summary>${escapeHtml(t("loginUrl"))}</summary>
+              <div class="login-url-row">
+                <input class="login-url-input" readonly value="${escapeAttribute(login.loginUrl)}" spellcheck="false" />
+                <div class="login-url-actions">
+                  <button class="ghost-button" data-action="open-login-url">${escapeHtml(t("openLoginUrl"))}</button>
+                  <button class="ghost-button" data-action="copy-login-url">${escapeHtml(t("copyLoginUrl"))}</button>
+                </div>
+              </div>
+            </details>
+          ` : ""}
+          ${login.diagnostic ? `<p class="login-diagnostic">${escapeHtml(login.diagnostic)}</p>` : ""}
+        </div>
+        <div class="login-modal-footer">
+          ${login.running ? `
+            <button class="ghost-button danger-button" data-action="cancel-login" ${state.busy ? "disabled" : ""}>
+              ${escapeHtml(t("cancelLogin"))}
+            </button>
+          ` : `
+            <button class="ghost-button" data-action="dismiss-login">
+              ${escapeHtml(t("dismiss"))}
+            </button>
+          `}
+        </div>
+      </div>
+    </div>
   `;
 }
 
