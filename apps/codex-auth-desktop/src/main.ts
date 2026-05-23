@@ -721,38 +721,32 @@ async function dismissLogin() {
   render();
   try {
     const sessionId = state.dashboard?.login.isolatedSessionId ?? null;
-    try {
-      const login = await invoke<LoginSnapshot>("clear_login_state");
-      if (state.dashboard) {
-        state.dashboard.login = login;
+    // Retry clear_login_state until the backend acknowledges.
+    // The background thread finishes within ~200ms of cancellation,
+    // so a few retries (up to 3s) is more than sufficient.
+    let cleared = false;
+    for (let i = 0; i < 30; i++) {
+      try {
+        const login = await invoke<LoginSnapshot>("clear_login_state");
+        if (state.dashboard) {
+          state.dashboard.login = login;
+        }
+        cleared = true;
+        break;
+      } catch {
+        await new Promise((r) => setTimeout(r, 100));
       }
-    } catch {
-      // Backend may reject clear_login_state if the background thread
-      // hasn't finished yet (running still true). Clear frontend state
-      // optimistically so the user is never stuck.
-      if (state.dashboard) {
-        state.dashboard.login = {
-          running: false,
-          finished: false,
-          success: false,
-          deviceAuth: false,
-          isolated: false,
-          output: "",
-          loginUrl: null,
-          isolatedSessionId: null,
-          startedAt: null,
-          finishedAt: null,
-          exitCode: null,
-          error: null,
-          cancelled: false,
-          refreshTokenReused: false,
-          phase: "",
-          browserUrlOpened: false,
-          importStarted: false,
-          importFinished: false,
-          diagnostic: null,
-        };
-      }
+    }
+    if (!cleared && state.dashboard) {
+      // Final fallback: clear frontend state optimistically.
+      state.dashboard.login = {
+        running: false, finished: false, success: false, deviceAuth: false,
+        isolated: false, output: "", loginUrl: null, isolatedSessionId: null,
+        startedAt: null, finishedAt: null, exitCode: null, error: null,
+        cancelled: false, refreshTokenReused: false, phase: "",
+        browserUrlOpened: false, importStarted: false, importFinished: false,
+        diagnostic: null,
+      };
     }
     if (sessionId) {
       try {
@@ -774,29 +768,25 @@ async function dismissLogin() {
 async function cancelLogin() {
   state.busy = true;
   render();
-  try {
-    await invoke<LoginSnapshot>("cancel_login");
-    // Optimistically mark cancelled on the frontend so the user sees
-    // immediate feedback; the background thread will finish within ~200ms.
-    if (state.dashboard) {
-      state.dashboard.login = {
-        ...state.dashboard.login,
-        running: false,
-        finished: true,
-        cancelled: true,
-        phase: "cancelled",
-        output: (state.dashboard.login?.output ?? "") + "\nLogin cancelled.",
-      };
-    }
-    syncLoginPolling();
-    setNoticeDescriptor("noticeCancelledLogin");
-  } catch (error) {
-    setErrorFromUnknown(error);
-  } finally {
-    state.busy = false;
-    syncDashboardRefresh();
-    render();
+  // Fire-and-forget the Rust cancel; don't wait for it.
+  const promise = invoke<LoginSnapshot>("cancel_login").catch(() => {});
+  // Immediately update frontend state so the user sees instant feedback.
+  if (state.dashboard) {
+    state.dashboard.login = {
+      ...state.dashboard.login,
+      running: false,
+      finished: true,
+      cancelled: true,
+      phase: "cancelled",
+      output: (state.dashboard.login?.output ?? "") + "\nLogin cancelled.",
+    };
   }
+  syncLoginPolling();
+  setNoticeDescriptor("noticeCancelledLogin");
+  state.busy = false;
+  syncDashboardRefresh();
+  render();
+  await promise;
 }
 
 function syncLoginPolling() {
