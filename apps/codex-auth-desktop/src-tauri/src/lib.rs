@@ -967,6 +967,8 @@ fn cancel_login_watchdog(inner: Arc<std::sync::Mutex<LoginJobState>>) {
     let mut job = inner.lock().expect("login state poisoned");
     job.running = false;
     job.finished = true;
+    job.cancelled = true;
+    job.success = false;
     job.finished_at = Some(now_label());
     job.phase = LOGIN_PHASE_CANCELLED.to_string();
     job.error = Some("Login cancelled (timeout).".to_string());

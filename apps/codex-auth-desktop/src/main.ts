@@ -960,6 +960,12 @@ async function refreshLoginState() {
   try {
     const next = await invokeWithTimeout<LoginSnapshot>("get_login_state", undefined, 15000);
     const wasRunning = state.dashboard.login.running;
+    // Don't overwrite a user-cancelled or user-dismissed login state
+    // with a stale backend snapshot (the background cancellation thread
+    // may not have finished yet).
+    if (state.dashboard.login.cancelled || state._loginDismissed) {
+      return;
+    }
     state.dashboard.login = next;
 
     if (wasRunning && !next.running) {
