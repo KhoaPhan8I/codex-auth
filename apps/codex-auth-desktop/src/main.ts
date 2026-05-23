@@ -637,7 +637,14 @@ async function runDashboardRequest(silent = false) {
 }
 
 function applyDashboard(dashboard: DashboardPayload) {
+  const login = state.dashboard?.login;
   state.dashboard = dashboard;
+  // Preserve frontend login state after user-cancelled so an in-flight
+  // dashboard response cannot overwrite the optimistic "cancelled" state
+  // and resurrect the login modal.
+  if (login?.cancelled) {
+    state.dashboard.login = login;
+  }
   if (!state.cliOverrideDirty) {
     state.cliOverrideInput = dashboard.cliRuntime.overridePath ?? "";
   }
