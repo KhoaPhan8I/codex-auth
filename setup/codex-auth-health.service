@@ -1,0 +1,6 @@
+[Unit]
+Description=codex-auth periodic health check
+
+[Service]
+Type=oneshot
+ExecStart=/home/khoaphan/.local/bin/codex-auth-health
